@@ -1,0 +1,22 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "aiaaa/deepseek-v4.1-flash",
+  "default_agent": "judge",
+  "providers": {
+    "aiaaa": {
+      "name": "AI AAA",
+      "env": ["AIAAA_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {"baseURL": "https://aiaaa.cc/v1", "apiKey": "{env:AIAAA_API_KEY}"},
+      "models": {
+        "deepseek-v4.1-flash": {
+          "modelID": "deepseek-v4.1-flash",
+          "name": "DeepSeek V4.1 Flash",
+          "capabilities": {"tools": true, "input": ["text"], "output": ["text"]},
+          "limit": {"context": 1000000, "output": 65536},
+          "variants": [{"id": "high", "body": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"}}]
+        }
+      }
+    }
+  }
+}

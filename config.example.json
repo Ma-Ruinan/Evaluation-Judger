@@ -1,0 +1,23 @@
+{
+  "dataset": "DeepInsight测试数据集",
+  "run_dir": "runs/deepinsight",
+  "dimensions": [1, 2, 4],
+  "subjects": [
+    {"id": "mobilework", "name": "MobileWork 0924", "prefix": "mobilework0924-"},
+    {"id": "workbuddy", "name": "WorkBuddy 5.5.6", "prefix": "workbuddy5.5.6-"}
+  ],
+  "process_excel": {
+    "path": "DeepInsight测试数据集/DeepInsight测试结果记录.xlsx",
+    "sheet": "Sheet1",
+    "first_row": 3,
+    "task_column": "C",
+    "subjects": {
+      "mobilework": {"runtime": "E", "status": "F"},
+      "workbuddy": {"runtime": "G", "status": "H"}
+    }
+  },
+  "model": "aiaaa/deepseek-v4.1-flash#high",
+  "opencode_major": 1,
+  "batch_size": 6,
+  "report_title": "DeepInsight AI Agent 应用能力评测报告"
+}

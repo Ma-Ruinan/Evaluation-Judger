@@ -1,0 +1,51 @@
+# Local design documents (not part of the published project)
+/技术方案.md
+/技术方案*.md
+/local-docs/
+/local-references/
+
+# Real evaluation datasets, submissions, and process records
+/DeepInsight测试数据集/
+/*测试数据集*/
+/*测评数据集*/
+/datasets/
+/data/
+/private-data/
+/*测试结果记录*.xlsx
+
+# Credentials and machine-specific configuration
+.env
+.env.*
+!.env.example
+/opencode.json
+/opencode.jsonc
+/evaluation-judger.local.toml
+/config.*.local.json
+/secrets/
+
+# Evaluation artifacts, logs, caches, and generated reports
+/.evaluation-judger/
+/runs/
+/outputs/
+/reports/
+/work/
+*.log
+
+# Python tooling
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.coverage
+htmlcov/
+/uv.lock
+
+# Editor and operating-system temporary files
+.DS_Store
+Thumbs.db
+~$*
