@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="1110" viewBox="0 0 1480 1110" role="img" aria-labelledby="title description">
+  <title id="title">Evaluation Judger evaluation pipeline</title>
+  <desc id="description">One dataset with one to three subjects. Configure and discover task inputs, isolate each task and subject, judge rubric atoms with evidence, validate and review conditional dependencies, determine critical errors, calculate and lock scores, produce task results when subjects are complete, dimension summaries when their tasks are complete, and a reviewed Word report when all configured results are complete. Process logs are archived separately. Invalid items can be repaired and unfinished work resumed.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6.3" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3.5 L0,7 Z" fill="#56667b"/></marker>
+    <marker id="repair" markerWidth="7" markerHeight="7" refX="6.3" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L7,3.5 L0,7 Z" fill="#a36c23"/></marker>
+    <style>
+      text { font-family: 'Microsoft YaHei','PingFang SC','Noto Sans CJK SC','Noto Sans SC',Arial,sans-serif; }
+      .title { font-size: 28px; font-weight: 650; fill: #172b45; }
+      .subtitle { font-size: 17px; fill: #58677b; }
+      .phase { font-size: 18px; font-weight: 600; fill: #34465d; }
+      .node-title { font-size: 24px; font-weight: 600; fill: #172b45; }
+      .number { font-size: 19px; font-weight: 500; fill: #77869a; }
+      .body { font-size: 16.5px; fill: #405168; }
+      .role { font-size: 12.5px; font-weight: 600; fill: #5e7185; }
+      .gate { font-size: 13px; font-weight: 600; fill: #42556d; }
+      .legend { font-size: 14px; fill: #58677b; }
+      .link { fill: none; stroke: #56667b; stroke-width: 1.8; stroke-linejoin: round; marker-end: url(#arrow); }
+      .retry { fill: none; stroke: #a36c23; stroke-width: 1.8; stroke-dasharray: 6 4; marker-end: url(#repair); }
+    </style>
+  </defs>
+  <rect width="1480" height="1110" fill="#fff"/>
+  <text x="48" y="49" class="title">Evaluation Judger Pipeline</text>
+  <text x="48" y="80" class="subtitle">基于任务 rubric 的证据判分、确定性汇总与报告生成</text>
+  <rect x="922" y="32" width="14" height="14" rx="2" fill="#f1f7f4" stroke="#a3bdb1"/><text x="944" y="45" class="legend">程序处理</text>
+  <rect x="1051" y="32" width="14" height="14" rx="2" fill="#edf3fa" stroke="#a4bddb"/><text x="1073" y="45" class="legend">LLM 判断</text>
+  <rect x="1186" y="32" width="14" height="14" rx="2" fill="#fff" stroke="#c2ccda"/><text x="1208" y="45" class="legend">结果产物</text>
+  <path d="M1320,39 H1350" class="retry"/><text x="1361" y="45" class="legend">定向修复</text>
+  <path d="M48,104 H1432" stroke="#dbe2eb" stroke-width="1"/>
+  <text x="48" y="129" class="body">输入：运行配置 · 题目与源素材 · Rubric-Council rubric · 受测对象交付 · 必需的测试记录 Excel</text>
+  <text x="48" y="169" class="phase">01  输入准备与独立判分</text>
+  <text x="48" y="408" class="phase">02  校验、复核与确定性计分</text>
+  <text x="48" y="673" class="phase">03  结果汇总与报告生成</text>
+
+<g data-node="1" data-kind="program"><rect x="48" y="190" width="316" height="155" rx="9" fill="#f1f7f4" stroke="#a3bdb1" stroke-width="1.3"/>
+<text x="68" y="217" class="role" >程序</text>
+<text x="68" y="252" class="number" >01</text>
+<text x="106" y="252" class="node-title" >配置加载</text>
+<text x="68" y="283" class="body" >数据集范围与 1–3 个受测对象</text>
+<text x="68" y="308" class="body" >维度、文件布局和过程表映射</text>
+<text x="68" y="333" class="body" >沿用指定 rubric 与模型配置</text>
+</g>
+<g data-node="2" data-kind="program"><rect x="404" y="190" width="316" height="155" rx="9" fill="#f1f7f4" stroke="#a3bdb1" stroke-width="1.3"/>
+<text x="424" y="217" class="role" >程序</text>
+<text x="424" y="252" class="number" >02</text>
+<text x="462" y="252" class="node-title" >任务发现</text>
+<text x="424" y="283" class="body" >匹配题目、源素材与 rubric</text>
+<text x="424" y="308" class="body" >归属各对象的完整交付文件</text>
+<text x="424" y="333" class="body" >核查必须的测试记录 Excel</text>
+</g>
+<g data-node="3" data-kind="program"><rect x="760" y="190" width="316" height="155" rx="9" fill="#f1f7f4" stroke="#a3bdb1" stroke-width="1.3"/>
+<text x="780" y="217" class="role" >程序</text>
+<text x="780" y="252" class="number" >03</text>
+<text x="818" y="252" class="node-title" >隔离与提取</text>
+<text x="780" y="283" class="body" >单题 × 单对象隔离材料</text>
+<text x="780" y="308" class="body" >提取可读文本，计算输入指纹</text>
+<text x="780" y="333" class="body" >复用指纹匹配的有效检查点</text>
+</g>
+<g data-node="4" data-kind="llm"><rect x="1116" y="190" width="316" height="155" rx="9" fill="#edf3fa" stroke="#a4bddb" stroke-width="1.3"/>
+<text x="1136" y="217" class="role" >OpenCode · LLM</text>
+<text x="1136" y="252" class="number" >04</text>
+<text x="1174" y="252" class="node-title" >逐原子判分</text>
+<text x="1136" y="283" class="body" >逐项状态、观察、理由与证据</text>
+<text x="1136" y="308" class="body" >比例项保存分子、分母与明细</text>
+<text x="1136" y="333" class="body" >分批判别，保留原始调用记录</text>
+</g>
+<g data-node="5" data-kind="program"><rect x="1116" y="430" width="316" height="155" rx="9" fill="#f1f7f4" stroke="#a3bdb1" stroke-width="1.3"/>
+<text x="1136" y="457" class="role" >程序</text>
+<text x="1136" y="492" class="number" >05</text>
+<text x="1174" y="492" class="node-title" >结果校验</text>
+<text x="1136" y="523" class="body" >字段、原子覆盖与数值一致性</text>
+<text x="1136" y="548" class="body" >比例明细和证据引用格式</text>
+<text x="1136" y="573" class="body" >通过后保存有效批次检查点</text>
+</g>
+<g data-node="6" data-kind="llm"><rect x="760" y="430" width="316" height="155" rx="9" fill="#edf3fa" stroke="#a4bddb" stroke-width="1.3"/>
+<text x="780" y="457" class="role" >LLM + 校验 · 按规则触发</text>
+<text x="780" y="492" class="number" >06</text>
+<text x="818" y="492" class="node-title" >关联项复核</text>
+<text x="780" y="523" class="body" >同一核验清单按规则对齐</text>
+<text x="780" y="548" class="body" >需要时复核关联项及历史时点</text>
+<text x="780" y="573" class="body" >复用旧交付本身不扣分</text>
+</g>
+<g data-node="7" data-kind="llm"><rect x="404" y="430" width="316" height="155" rx="9" fill="#edf3fa" stroke="#a4bddb" stroke-width="1.3"/>
+<text x="424" y="457" class="role" >OpenCode · LLM</text>
+<text x="424" y="492" class="number" >07</text>
+<text x="462" y="492" class="node-title" >关键错误判定</text>
+<text x="424" y="523" class="body" >按 rubric 判定关键错误触发</text>
+<text x="424" y="548" class="body" >保存具体依据与证据位置</text>
+<text x="424" y="573" class="body" >不由模型直接决定汇总分</text>
+</g>
+<g data-node="8" data-kind="program"><rect x="48" y="430" width="316" height="155" rx="9" fill="#f1f7f4" stroke="#a3bdb1" stroke-width="1.3"/>
+<text x="68" y="457" class="role" >程序</text>
+<text x="68" y="492" class="number" >08</text>
+<text x="106" y="492" class="node-title" >确定性计分</text>
+<text x="68" y="523" class="body" >原子权重 → 完成率与质量分</text>
+<text x="68" y="548" class="body" >最终分 = min(原始分，上限)</text>
+<text x="68" y="573" class="body" >锁定评分 JSON 与证据记录</text>
+</g>
+<g data-node="9" data-kind="artifact"><rect x="48" y="710" width="316" height="195" rx="9" fill="#fff" stroke="#c2ccda" stroke-width="1.3"/>
+<rect x="64" y="722" width="284" height="25" rx="4" fill="#eef2f6"/>
+<text x="74" y="740" class="gate" >题内纳入对象齐全</text>
+<text x="68" y="772" class="number" >09</text>
+<text x="106" y="772" class="node-title" >逐题结果 / 比较</text>
+<text x="68" y="803" class="body" >各对象独立得分与具体依据</text>
+<text x="68" y="828" class="body" >多对象展示同项差异与归因</text>
+<text x="68" y="853" class="body" >Markdown + 完整评分记录</text>
+<text x="68" y="878" class="body" >单对象评分；多对象比较</text>
+</g>
+<g data-node="10" data-kind="artifact"><rect x="404" y="710" width="316" height="195" rx="9" fill="#fff" stroke="#c2ccda" stroke-width="1.3"/>
+<rect x="420" y="722" width="284" height="25" rx="4" fill="#eef2f6"/>
+<text x="430" y="740" class="gate" >维度内题目齐全</text>
+<text x="424" y="772" class="number" >10</text>
+<text x="462" y="772" class="node-title" >维度总评</text>
+<text x="424" y="803" class="body" >按题等权，保留六项分数</text>
+<text x="424" y="828" class="body" >逐题对象差值与证据索引</text>
+<text x="424" y="853" class="body" >Markdown + JSON 汇总</text>
+<text x="424" y="878" class="body" >用时、状态另存，不进入总评</text>
+</g>
+<g data-node="11" data-kind="llm"><rect x="760" y="710" width="316" height="195" rx="9" fill="#edf3fa" stroke="#a4bddb" stroke-width="1.3"/>
+<rect x="776" y="722" width="284" height="25" rx="4" fill="#eef2f6"/>
+<text x="786" y="740" class="gate" >配置范围内全部结果齐全</text>
+<text x="780" y="772" class="number" >11</text>
+<text x="818" y="772" class="node-title" >报告写作与复核</text>
+<text x="780" y="803" class="body" >仅使用锁定总评和评分事实</text>
+<text x="780" y="828" class="body" >模型写作 → 独立文字复核</text>
+<text x="780" y="853" class="body" >最多修订一次，不重新判分</text>
+<text x="780" y="878" class="body" >失败则保留确定性摘要</text>
+</g>
+<g data-node="12" data-kind="program"><rect x="1116" y="710" width="316" height="195" rx="9" fill="#f1f7f4" stroke="#a3bdb1" stroke-width="1.3"/>
+<text x="1136" y="737" class="role" >程序 · 文档产物</text>
+<text x="1136" y="772" class="number" >12</text>
+<text x="1174" y="772" class="node-title" >图表与报告输出</text>
+<text x="1136" y="803" class="body" >锁定分数生成图表和原生表格</text>
+<text x="1136" y="828" class="body" >Word 报告含逐题评分附录</text>
+<text x="1136" y="853" class="body" >注明纳入范围、结果与局限</text>
+<text x="1136" y="878" class="body" >正文不含用时和运行状态</text>
+</g>
+<g class="link">
+  <path d="M364,267.5 H400"/><path d="M720,267.5 H756"/><path d="M1076,267.5 H1112"/>
+  <path d="M1274,345 V426"/>
+  <path d="M1116,507.5 H1080"/><path d="M760,507.5 H724"/><path d="M404,507.5 H368"/>
+  <path d="M206,585 V619 H384 V690 H206 V706"/>
+  <path d="M364,807.5 H400"/><path d="M720,807.5 H756"/><path d="M1076,807.5 H1112"/>
+</g>
+<path d="M1360,430 V349" class="retry"/>
+<text x="1234" y="386" class="legend" text-anchor="end">逐题 × 逐对象</text>
+<text x="1377" y="386" font-size="14" fill="#a36c23">修复</text>
+<rect x="48" y="955" width="672" height="86" rx="7" fill="#f8fafc" stroke="#dbe2eb"/>
+<rect x="760" y="955" width="672" height="86" rx="7" fill="#f8fafc" stroke="#dbe2eb"/>
+<text x="68" y="982" class="phase">独立记录归档</text>
+<text x="68" y="1007" class="body">受测对象测试 Excel 与评测程序日志分别留存。</text>
+<text x="68" y="1030" class="body">用于追溯，不进入维度总评或最终报告。</text>
+<text x="780" y="982" class="phase">容错与续跑</text>
+<text x="780" y="1007" class="body">保留有效检查点，失败项不阻断其他题目；续跑只补缺项。</text>
+<text x="780" y="1030" class="body">复用完成结果前，核对输入指纹和判分一致性。</text>
+<text x="48" y="1082" class="subtitle">图 1. 模型负责证据判断与报告文字，程序负责验证、算分和汇总；一次运行处理一个数据集。</text>
+</svg>

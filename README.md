@@ -2,6 +2,14 @@
 
 读取一个数据集中的题目、Rubric-Council `rubric.md`、源素材、受测对象交付和测试过程 Excel，借助 OpenCode 逐项判分，生成可追溯的逐题结果、维度总评和 Word 报告。一次运行处理一个数据集，支持 1–3 个受测对象。
 
+## Pipeline
+
+[![Evaluation Judger pipeline](docs/assets/evaluation-judger-pipeline.png)](docs/assets/evaluation-judger-pipeline.svg)
+
+图示对应当前开发版本。模型独立判断评分项并提供证据；程序校验、计分和汇总。逐题、维度和数据集分别检查结果齐全条件，过程记录独立归档。
+
+[SVG 矢量图](docs/assets/evaluation-judger-pipeline.svg) · [PNG 高清图](docs/assets/evaluation-judger-pipeline.png)
+
 ## 安装
 
 需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和 OpenCode。当前中转站拒绝 OpenCode v2 自动发送的 `prompt_cache_key`；本项目默认使用隔离安装的 OpenCode 1.18.23，不改变系统中的 OpenCode。
