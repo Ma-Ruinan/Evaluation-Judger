@@ -42,6 +42,18 @@ class Rubric:
         return tuple(a for a in self.atoms if a.metric == metric)
 
 
+def referenced_atoms(rule: str) -> tuple[str, ...]:
+    """Identify atom references without assuming what kind of relationship they mean."""
+    match = re.search(r"同\s*([A-Z]\d+(?:\s*/\s*[A-Z]\d+)*)", rule)
+    return tuple(re.findall(r"[A-Z]\d+", match.group(1))) if match else ()
+
+
+def shared_sample_references(rule: str) -> tuple[str, ...]:
+    """Only exact shared review sets, not 'sampling rule same as' or 'split same as'."""
+    match = re.search(r"(?:核验全集|核验集合与抽样清单)\s*同\s*([A-Z]\d+(?:\s*/\s*[A-Z]\d+)*)", rule)
+    return tuple(re.findall(r"[A-Z]\d+", match.group(1))) if match else ()
+
+
 def _cells(line: str) -> list[str]:
     return [c.strip() for c in line.strip().strip("|").split("|")]
 

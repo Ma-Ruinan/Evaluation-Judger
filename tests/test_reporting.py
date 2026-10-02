@@ -1,0 +1,51 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import TestCase
+from unittest.mock import patch
+
+from docx import Document
+
+from evaluation_judger.reporting import _facts, _fallback, compose_narrative, make_formal_report
+import json
+from evaluation_judger.rubric import METRICS
+
+
+class LockedReport(TestCase):
+    def test_review_findings_are_repaired_then_cached_without_rewriting(self):
+        facts = {"dataset": "样例数据集", "task_count": 1, "dimension_count": 1,
+                 "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}}}
+        draft = _fallback(facts)
+        def answer(value):
+            return "BEGIN_JUDGMENT " + json.dumps(value, ensure_ascii=False) + " END_JUDGMENT", False
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses = [answer(draft), answer({"ok": False, "issues": ["错误类别概括过宽"]}),
+                         answer(draft), answer({"ok": True, "issues": []})]
+            with patch("evaluation_judger.reporting.run", side_effect=responses) as model:
+                first = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+                second = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+            self.assertEqual(model.call_count, 4)
+            self.assertEqual(first["source"], "opencode")
+            self.assertEqual(first, second)
+            self.assertTrue((root / "reports/writer-draft.json").exists())
+
+    def test_formal_report_uses_locked_dimension_data(self):
+        def scores(value):
+            return {**{m: {"final": "100" if m == "completion" else value} for m in METRICS}, "quality_mean": value}
+
+        config = {"dataset": ".", "subjects": [{"id": "a", "name": "甲"}, {"id": "b", "name": "乙"}], "report_title": "试跑报告"}
+        dimensions = {"维度一": {
+            "tasks": ["1.1"],
+            "task_results": [{"task_id": "1.1", "task_name": "样例题", "subjects": {"a": {"scores": scores("4"), "main_losses": []}, "b": {"scores": scores("3"), "main_losses": []}}}],
+            "subjects": {sid: {"process_stats": {"recorded_success_count": 1, "duration_count": 1, "mean_seconds": "60"}} for sid in ("a", "b")},
+        }}
+        with TemporaryDirectory() as directory:
+            with patch("evaluation_judger.reporting.compose_narrative", side_effect=lambda facts, *_: _fallback(facts)):
+                target = make_formal_report(config, dimensions, Path(directory), Path(directory))
+            doc = Document(target)
+            text = "\n".join(p.text for p in doc.paragraphs)
+            self.assertIn("执行摘要", text)
+            self.assertIn("维度一", text)
+            self.assertEqual(_facts(dimensions, config)["subjects"]["a"]["averages"]["quality_mean"], "4")
+            self.assertIn("4.00", "\n".join(cell.text for table in doc.tables for row in table.rows for cell in row.cells))

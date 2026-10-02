@@ -80,8 +80,65 @@ def extract_json(text: str) -> dict:
     return result
 
 
-def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, model: str, timeout: int = 1800, major: int = 1) -> tuple[str, bool]:
+def event_session(path: Path) -> str | None:
+    session = None
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+            session = event.get("sessionID") or event.get("part", {}).get("sessionID") or session
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return session
+
+
+class TaskSession:
+    """Reuse evidence context only inside one fingerprinted task-participant workspace."""
+    def __init__(self, workspace: Path, project: Path, model: str, major: int, fingerprint: str):
+        self.workspace, self.project, self.model, self.major = workspace, project, model, major
+        self.fingerprint = fingerprint
+        self.checkpoint = workspace / "checkpoints" / "judge-session.json"
+        self.session_id = None
+        if major != 1:
+            return
+        recover_events = not self.checkpoint.exists()
+        if self.checkpoint.exists():
+            try:
+                saved = json.loads(self.checkpoint.read_text(encoding="utf-8"))
+                if not isinstance(saved, dict):
+                    raise ValueError("Invalid session checkpoint")
+                if saved.get("fingerprint") == fingerprint and isinstance(saved.get("session_id"), str):
+                    self.session_id = saved["session_id"]
+            except (OSError, ValueError, TypeError):
+                recover_events = True
+        if recover_events and workspace.name == fingerprint[:12]:
+            for event in sorted((workspace / "events").glob("atoms-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
+                self.session_id = event_session(event)
+                if self.session_id:
+                    break
+
+    def ask(self, prompt: str, title: str, output: Path) -> tuple[str, bool]:
+        try:
+            return run(self.workspace, prompt, title, output, self.project, self.model,
+                       major=self.major, session_id=self.session_id)
+        finally:
+            if self.major == 1:
+                session = event_session(output)
+                if session:
+                    self.session_id = session
+                    self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = self.checkpoint.with_suffix(".json.tmp")
+                    temporary.write_text(json.dumps({"fingerprint": self.fingerprint, "session_id": session}), encoding="utf-8")
+                    temporary.replace(self.checkpoint)
+
+
+def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, model: str, timeout: int = 900, major: int = 1, *, session_id: str | None = None, _continue_length: bool = True) -> tuple[str, bool]:
     env = environment(project)
+    if timeout == 900:
+        timeout = int(env.get("OPENCODE_REQUEST_TIMEOUT_SECONDS", "900"))
+    if timeout < 1:
+        raise JudgeError("OPENCODE_REQUEST_TIMEOUT_SECONDS must be positive")
     executable = _executable(project, major)
     if major == 1:
         # V1 and V2 use incompatible global SQLite schemas.
@@ -95,6 +152,8 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
         command.insert(2, "--standalone")
     elif variant:
         command += ["--variant", variant]
+    if session_id:
+        command += ["--session", session_id]
     if len(prompt) > 16_000:
         prompt_file = workspace / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
@@ -105,10 +164,47 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
     try:
         completed = subprocess.run(command, cwd=workspace, env=env, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
+        # subprocess still exposes output captured before the timeout. Preserve it
+        # so a later run can salvage completed atom decisions.
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(_clean(partial, env), encoding="utf-8")
         raise JudgeError(f"OpenCode timed out after {timeout}s") from exc
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_clean(completed.stdout, env), encoding="utf-8")
     answer, terminal_error, used_read = parse_events(completed.stdout)
+    finishes, response_session = [], None
+    for line in completed.stdout.splitlines():
+        try:
+            event = json.loads(line)
+            response_session = event.get("sessionID") or response_session
+            if event.get("type") == "step_finish":
+                finishes.append(event.get("part", {}))
+        except (ValueError, TypeError):
+            continue
+    complete_json = False
+    try:
+        payload = re.sub(r"^BEGIN_JUDGMENT\s*", "", answer.strip())
+        payload = re.sub(r"^```(?:json)?\s*|\s*```$", "", payload, flags=re.I)
+        complete_json = isinstance(json.loads(payload), dict)
+    except (ValueError, TypeError):
+        pass
+    length_limited = bool(finishes and finishes[-1].get("reason") == "length" and "END_JUDGMENT" not in answer and not complete_json)
+    if length_limited and major == 1 and response_session and _continue_length:
+        continuation = output.with_name(output.stem + "-continuation.jsonl")
+        final_answer, more_read = run(
+            workspace,
+            "The previous response reached its length limit before completing the judgment JSON. "
+            "Use the evidence and findings already read in THIS task session. Finish the requested judgment now: "
+            "return the complete JSON between BEGIN_JUDGMENT and END_JUDGMENT, not just the missing suffix. "
+            "Keep explanations specific and concise. Do not repeat source exploration already completed.",
+            title + " finish judgment", continuation, project, model, timeout, major,
+            session_id=response_session, _continue_length=False)
+        return final_answer, used_read or more_read
+    if length_limited:
+        raise JudgeError("Response length limit reached before complete judgment text; retry a smaller atom group")
     if not answer:
         details = _clean(completed.stderr[-1500:] or terminal_error or "No response text", env)
         raise JudgeError(f"OpenCode returned no answer (exit {completed.returncode}): {details}")

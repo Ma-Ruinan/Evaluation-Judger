@@ -18,6 +18,7 @@
   },
   "model": "aiaaa/deepseek-v4.1-flash#high",
   "opencode_major": 1,
-  "batch_size": 6,
+  "batch_size": 4,
+  "report_mode": "auto",
   "report_title": "DeepInsight AI Agent 应用能力评测报告"
 }

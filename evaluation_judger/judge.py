@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import shutil
 import hashlib
-import re
 from datetime import datetime
 from pathlib import Path
 
 from .dataset import Task, process_records, task_fingerprint
 from .materials import extract
-from .opencode import JudgeError, extract_json, parse_events, probe, run
+from .multisample import review_multi_atom
+from .opencode import JudgeError, TaskSession, extract_json, parse_events, probe, run
+from .rubric import shared_sample_references
 from .scoring import calculate, shared_items_match, validate_atom
 
 
@@ -23,6 +24,26 @@ def write_json(path: Path, value: object) -> None:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def needs_time_review(atom, record: dict, process_record: dict) -> bool:
+    return (record.get("state") == "0" and atom.kind == "BIN"
+            and "实际执行" in atom.rule and "截止" in atom.rule
+            and not process_record.get("executed_at"))
+
+
+def atom_batches(atoms, size: int):
+    """Keep long claim audits separate, while batching smaller rubric checks."""
+    if size < 1:
+        raise ValueError("batch_size must be positive")
+    index = 0
+    while index < len(atoms):
+        end = index + 1
+        if atoms[index].kind != "CLAIM-RATIO":
+            while end < len(atoms) and end - index < size and atoms[end].kind != "CLAIM-RATIO":
+                end += 1
+        yield index, atoms[index:end]
+        index = end
 
 
 def workspace_for(task: Task, subject: str, config: dict, project: Path, run_dir: Path) -> tuple[Path, dict]:
@@ -62,7 +83,7 @@ def _prompt(task: Task, subject: str, atoms, manifest: dict, previous_error: str
     files = [f"- {item['file']} => {item['extracted']}" + (f" [modified {item['modified_at']}]" if item.get("modified_at") else "") + (f" [LIMITATION: {item['limitation']}]" if item["limitation"] else "") for item in manifest["files"]]
     rules = [dict(id=a.id, metric=a.metric, weight=str(a.weight), purpose=a.purpose, rule=a.rule, required_evidence=a.evidence) for a in atoms]
     time_notes = [line.strip() for line in task.rubric.text.splitlines() if ("评测基准日" in line or "时间／版本边界" in line)][:5]
-    return f"""You evaluate task {task.id} ({task.name}) for participant {subject}. Use only this participant's delivery, task question, rubric, process record and common sources in this isolated workspace. Read the extracted files with the read tool, including the participant delivery and relevant source anchors. The extracted text has line/page/paragraph locators. Original files are also present when extraction is limited.
+    return f"""You evaluate task {task.id} ({task.name}) for participant {subject}. Use only this participant's delivery, task question, rubric, process record and common sources in this isolated workspace. Read the extracted files with the read tool when they have not already been read in THIS same task-participant session, including the participant delivery and relevant source anchors. Reuse already inspected evidence where applicable; inspect any additional scope required by the assigned atoms. The extracted text has line/page/paragraph locators. Original files are also present when extraction is limited.
 
 Files:\n{chr(10).join(files)}
 Process record: {json.dumps(manifest['process_record'], ensure_ascii=False, default=str)}
@@ -74,7 +95,7 @@ Return one decision for EVERY assigned atom, in this order. Use the exact rubric
 
 Each decision must have id, state, observation (what the delivery actually says or lacks), reason (specific explanation linking observation to rule), evidence array of {{file,locator,quote}}, and ratio fields where applicable. Evidence `file` must be one of the listed original or extracted paths, or a full HTTPS URL. For a missing item, identify which delivery files and sections you checked; use the inspected delivery as evidence. Quotes should be short and literal where text exists; do not join distant passages with ellipses in one quote. Avoid generic reasons such as 'insufficient' without a concrete explanation. Explain uncertain evidence and still reach a supported score; do not invent a negative finding from lack of access.
 
-Return JSON only between BEGIN_JUDGMENT and END_JUDGMENT, shape: {{"atoms":[...]}}. Do not omit any atom.
+Write observations, reasons and item explanations in clear Chinese. Each item explanation must address that exact item's subject, predicate, date and scope; support for another statement in the same paragraph does not establish support for this statement. A related reference title alone does not establish its unseen contents. State what was actually inspected and any access limitations, then apply the rubric without inventing a negative finding. Preserve literal evidence quotes in their original language. Return JSON only between BEGIN_JUDGMENT and END_JUDGMENT, shape: {{"atoms":[...]}}. Do not omit any atom.
 {('Previous attempt failed validation: ' + previous_error) if previous_error else ''}
 """
 
@@ -93,26 +114,31 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
         probe(workspace, project, model, major)
         write_json(workspace / "probe-ok.json", {"ok": True})
     known_files = {item[key] for item in manifest["files"] for key in ("file", "extracted")} | {"manifest.json"}
+    session = TaskSession(workspace, project, model, major, manifest["fingerprint"])
     atoms = task.rubric.atoms
-    batch_size = int(config.get("batch_size", 6))
+    batch_size = int(config.get("batch_size", 4))
+    saved_atoms = {}
+    by_id = {atom.id: atom for atom in atoms}
+    for old_checkpoint in sorted((workspace / "checkpoints").glob("atoms-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            saved = json.loads(old_checkpoint.read_text(encoding="utf-8"))
+            if saved.get("fingerprint") != manifest["fingerprint"]:
+                continue
+            for raw in saved["atoms"]:
+                if raw.get("id") in by_id and raw["id"] not in saved_atoms:
+                    saved_atoms[raw["id"]] = validate_atom(raw, by_id[raw["id"]], known_files)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
     records = []
-    for index in range(0, len(atoms), batch_size):
-        batch = atoms[index:index + batch_size]
+    for index, batch in atom_batches(atoms, batch_size):
         checkpoint = workspace / "checkpoints" / f"atoms-{index:03d}.json"
-        if checkpoint.exists():
-            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
-            if saved.get("fingerprint") == manifest["fingerprint"]:
-                try:
-                    records += [validate_atom(r, a, known_files) for r, a in zip(saved["atoms"], batch, strict=True)]
-                    continue
-                except (ValueError, KeyError, TypeError):
-                    pass
+        if all(a.id in saved_atoms for a in batch):
+            records += [saved_atoms[a.id] for a in batch]
+            continue
         event_dir = workspace / "events"
         event_dir.mkdir(parents=True, exist_ok=True)
-        event_glob = f"atoms-{index:03d}-*.jsonl"
-        if not list(event_dir.glob(event_glob)):
-            run(workspace, _prompt(task, subject, batch, manifest), f"judge {task.id} {subject} atoms {index + 1}-{index + len(batch)}", event_dir / f"atoms-{index:03d}-attempt-0.jsonl", project, model, major=major)
-        found: dict[str, dict] = {}
+        event_glob = "atoms-*.jsonl"
+        found: dict[str, dict] = {a.id: saved_atoms[a.id] for a in batch if a.id in saved_atoms}
 
         def harvest() -> None:
             for old_event in sorted(event_dir.glob(event_glob), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -131,13 +157,30 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
                         continue
 
         harvest()
+        if not found:
+            for attempt in range(2):
+                event = event_dir / f"atoms-{index:03d}-attempt-{attempt}.jsonl"
+                if event.exists():
+                    continue
+                try:
+                    session.ask(_prompt(task, subject, batch, manifest), f"judge {task.id} {subject} atoms {index + 1}-{index + len(batch)}", event)
+                except JudgeError as exc:
+                    if "Response length limit" in str(exc):
+                        break  # Repeating the same large group is unlikely to help.
+                    pass  # The raw event remains available for salvage on this or a later run.
+                harvest()
+                if found:
+                    break
         for atom in batch:
             if atom.id in found:
                 continue
             for attempt in range(3):
                 prompt = _prompt(task, subject, [atom], manifest, "Earlier output for this atom was incomplete. Supply a numeric state and an itemized check for every counted element.")
                 event = event_dir / f"atoms-{index:03d}-{atom.id}-attempt-{attempt}.jsonl"
-                answer, _ = run(workspace, prompt, f"repair {task.id} {subject} {atom.id}", event, project, model, major=major)
+                try:
+                    session.ask(prompt, f"repair {task.id} {subject} {atom.id}", event)
+                except JudgeError:
+                    pass
                 harvest()
                 if atom.id in found:
                     break
@@ -149,7 +192,7 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
         print(f"  {task.id}/{subject}: {len(records)}/{len(atoms)} atoms", flush=True)
     for position, atom in enumerate(atoms):
         record = records[position]
-        if record["state"] != "0" or "实际执行" not in atom.rule or "基准日" not in (record["reason"] + record["observation"]):
+        if not needs_time_review(atom, record, manifest["process_record"]):
             continue
         dates = sorted({item["modified_at"][:10] for item in manifest["files"] if item["category"] == "deliveries" and item.get("modified_at")})
         if not dates:
@@ -165,10 +208,10 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
         records[position] = reviewed
     indexed = {record["id"]: i for i, record in enumerate(records)}
     for atom in atoms:
-        reference = re.search(r"同\s*([A-Z]\d+)", atom.rule)
-        if not reference or reference.group(1) not in indexed or atom.kind not in ("RATIO", "CLAIM-RATIO"):
+        references = shared_sample_references(atom.rule)
+        if len(references) != 1 or references[0] not in indexed or atom.kind not in ("RATIO", "CLAIM-RATIO"):
             continue
-        source_id = reference.group(1)
+        source_id = references[0]
         source_atom = next(a for a in atoms if a.id == source_id)
         source_pos, target_pos = indexed[source_id], indexed[atom.id]
 
@@ -222,15 +265,24 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
         target = records[target_pos]
         required = int(source["denominator"])
         if source_repaired or int(target["denominator"]) != required or len(target["items"]) != required or not shared_items_match(source["items"], target["items"]):
-            instruction = f"The rubric requires exactly the SAME sampled claims as {source_id}. Use this locked {source_id} list, one corresponding {atom.id} item per claim, in the same order: {json.dumps(source['items'], ensure_ascii=False)}. Do not introduce or omit claims. The denominator must be {required}. Judge each item by {atom.rule}."
+            instruction = f"The rubric requires exactly the SAME sampled claims as {source_id}. Use this locked {source_id} list, one corresponding {atom.id} item per claim, in the same order: {json.dumps(source['items'], ensure_ascii=False)}. Do not introduce or omit claims. The denominator must be {required}. Judge each item by {atom.rule}. Each explanation and supporting source must address the exact locked claim's subject, predicate and scope. A paragraph or line can contain several different claims: support for another claim on the same line does not support this claim. Copying a label while judging a different statement is invalid. Show which concrete source passage supports the locked statement; a related source title alone does not establish support."
             records[target_pos] = repair(atom, target, instruction, required, atom.id, source["items"])
+    for atom in atoms:
+        references = shared_sample_references(atom.rule)
+        if len(references) < 2 or atom.kind not in ("RATIO", "CLAIM-RATIO") or any(ref not in indexed for ref in references):
+            continue
+        position = indexed[atom.id]
+        records[position] = review_multi_atom(atom, {ref: records[indexed[ref]] for ref in references}, records[position],
+                                              task_id=task.id, subject=subject, workspace=workspace,
+                                              fingerprint=manifest["fingerprint"], known_files=known_files,
+                                              project=project, model=model, major=major)
     error_checkpoint = workspace / "checkpoints" / "errors.json"
     error_hash = _digest(records)
     cached_errors = json.loads(error_checkpoint.read_text(encoding="utf-8")) if error_checkpoint.exists() else {}
     if cached_errors.get("input_hash") == error_hash:
         decisions = cached_errors["errors"]
     elif task.rubric.errors:
-        answer, _ = run(workspace, _error_prompt(task, subject, manifest, records), f"judge {task.id} {subject} critical errors", workspace / "events" / "errors.jsonl", project, model, major=major)
+        answer, _ = session.ask(_error_prompt(task, subject, manifest, records), f"judge {task.id} {subject} critical errors", workspace / "events" / "errors.jsonl")
         decisions = extract_json(answer)["errors"]
         expected = {e.id for e in task.rubric.errors}
         if {e.get("id") for e in decisions} != expected or len(decisions) != len(expected):
@@ -249,6 +301,7 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
     result = {
         "task_id": task.id, "task_name": task.name, "dimension": task.dimension,
         "subject": subject, "fingerprint": manifest["fingerprint"],
+        "multi_sample_review_version": 3,
         "input_files": manifest["files"], "atoms": records, "errors": decisions,
         "scores": calculate(task.rubric, records, decisions),
     }

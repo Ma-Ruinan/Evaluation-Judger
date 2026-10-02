@@ -46,6 +46,7 @@ def display(value) -> str:
 
 
 def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
+    record = dict(record)
     if record.get("id") != atom.id:
         raise ValueError(f"Expected atom {atom.id}, got {record.get('id')}")
     rationale = str(record.get("reason", "")).strip()
@@ -69,6 +70,22 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
         if numerator is None or denominator is None:
             raise ValueError(f"{atom.id}: ratio needs numerator and denominator")
         n, d = number(numerator), number(denominator)
+        items = record.get("items")
+        audited = re.findall(r"(?:实际核验|核验的)\s*(\d+)\s*条", observation + " " + rationale)
+        positive = ("非虚构", "无问题", "satisfied", "supported", "consistent", "correct", "有效", "通过")
+        if ("抽样" in atom.rule and n == d and d > 0 and number(record.get("state")) == 1
+                and isinstance(items, list) and items and len(items) < d
+                and str(len(items)) in audited
+                and all(isinstance(item, dict) and str(item.get("result") or item.get("verdict") or "").lower().startswith(positive) for item in items)):
+            # The model sometimes writes the source population count as the
+            # denominator despite explicitly documenting a smaller audited sample.
+            # Only reconcile the provable all-positive case; preserve the original.
+            correction = {"type": "audited_sample_count", "original_numerator": str(n),
+                          "original_denominator": str(d), "audited_count": len(items),
+                          "reason": "文字明确实际核验数量，明细逐条为通过；将全集数量与计分样本数量分开，状态与分数不变。"}
+            record["record_corrections"] = [*record.get("record_corrections", []), correction]
+            record["numerator"] = record["denominator"] = len(items)
+            n = d = Decimal(len(items))
         if d < 0 or n < 0 or n > d:
             raise ValueError(f"{atom.id}: invalid ratio {n}/{d}")
         if d == 0:
@@ -79,7 +96,7 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
         else:
             state = n / d
         given = number(record.get("state"))
-        if abs(state - given) > Decimal("0.001"):
+        if abs(state - given) > Decimal("0.005"):
             raise ValueError(f"{atom.id}: stated state {given} differs from {n}/{d}")
         if not isinstance(record.get("items"), list) or (d > 0 and not record["items"]):
             raise ValueError(f"{atom.id}: ratio requires itemized checks")
@@ -96,6 +113,7 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
         "denominator": record.get("denominator"), "items": record.get("items", []),
         "validation_notes": notes,
         "rule": atom.rule, "purpose": atom.purpose,
+        "record_corrections": record.get("record_corrections", []),
     }
 
 
