@@ -2,39 +2,23 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import json
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .dataset import discover, load_config, process_records, task_fingerprint
 from .judge import judge_task
-from .judge import write_json
+from .judge import write_json, write_text
 from .render import make_report, summaries, task_markdown
 from .reporting import make_formal_report
 from .rubric import shared_sample_references
-from .scoring import calculate, shared_items_match
+from .scoring import calculate, shared_items_match, result_is_consistent as _result_is_consistent
 
 
-def _result_is_consistent(task, result: dict) -> bool:
-    try:
-        records = result["atoms"]
-        indexed = {r["id"]: r for r in records}
-        if len(indexed) != len(task.rubric.atoms):
-            return False
-        if calculate(task.rubric, records, result["errors"]) != result["scores"]:
-            return False
-        if any(len(shared_sample_references(atom.rule)) > 1 for atom in task.rubric.atoms) and result.get("multi_sample_review_version") != 3:
-            return False
-        for atom in task.rubric.atoms:
-            references = shared_sample_references(atom.rule)
-            if len(references) == 1 and references[0] in indexed and atom.kind in ("RATIO", "CLAIM-RATIO"):
-                source, target = indexed[references[0]], indexed[atom.id]
-                required = int(source["denominator"])
-                if int(target["denominator"]) != required or len(source["items"]) != required or len(target["items"]) != required or not shared_items_match(source["items"], target["items"]):
-                    return False
-        return True
-    except (KeyError, ValueError, TypeError):
-        return False
 
 
 def _context(config_path: Path):
@@ -61,13 +45,86 @@ def _results(config, run_dir, tasks):
                 except (OSError, ValueError):
                     missing.append((task.id, subject["id"]))
                     continue
-                if isinstance(loaded, dict) and loaded.get("fingerprint") == task_fingerprint(task, subject["id"], config) and _result_is_consistent(task, loaded):
+                needs_critical_review = (config.get("critical_error_review", False) and isinstance(loaded, dict)
+                    and any(entry.get("triggered") for entry in loaded.get("errors", []))
+                    and loaded.get("critical_error_review_version") != 1)
+                if isinstance(loaded, dict) and not needs_critical_review and loaded.get("fingerprint") == task_fingerprint(task, subject["id"], config) and _result_is_consistent(task, loaded):
                     result_map[(task.id, subject["id"])] = loaded
                 else:
                     missing.append((task.id, subject["id"]))
             else:
                 missing.append((task.id, subject["id"]))
     return result_map, missing
+
+
+_attempts_lock = threading.Lock()
+
+
+def _run_task(task, config, project, run_dir):
+    failures = []
+    for subject in config["subjects"]:
+        existing, _ = _results(config, run_dir, [task])
+        if (task.id, subject["id"]) in existing:
+            print(f"Reusing {task.id} / {subject['name']}", flush=True)
+            continue
+        print(f"Judging {task.id} / {subject['name']}", flush=True)
+        started_at = datetime.now(timezone.utc).isoformat()
+        started = time.perf_counter()
+        outcome = 'incomplete'
+        try:
+            judge_task(task, subject["id"], config, project, run_dir)
+            outcome = 'completed'
+        except Exception as exc:
+            # Retain all prior checkpoints and continue independent subjects/tasks.
+            failure = {"task": task.id, "subject": subject["id"], "error_type": type(exc).__name__, "message": str(exc)}
+            failures.append(failure)
+            print(f"Incomplete {task.id} / {subject['name']}: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            archive = run_dir / 'operation-records' / 'judging-attempts.jsonl'
+            archive.parent.mkdir(parents=True, exist_ok=True)
+            record = {'record_type': 'evaluator_attempt', 'task': task.id, 'subject': subject['id'],
+                      'started_at': started_at, 'finished_at': datetime.now(timezone.utc).isoformat(),
+                      'elapsed_seconds': round(time.perf_counter()-started, 3), 'outcome': outcome}
+            with _attempts_lock:
+                with archive.open('a', encoding='utf-8') as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False)+'\n')
+    return failures
+
+
+def _run_tasks_once(tasks, config, project, run_dir):
+    workers = config.get("task_workers", 1)
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 4:
+        raise ValueError("task_workers must be an integer in 1-4")
+    if workers == 1:
+        for task in tasks:
+            yield task, _run_task(task, config, project, run_dir)
+        return
+    # Keep dimensions in their configured order. Each task has one owner;
+    # subjects are judged sequentially inside that task's isolated workspaces.
+    for dimension in dict.fromkeys(t.dimension for t in tasks):
+        selected = [task for task in tasks if task.dimension == dimension]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_run_task, task, config, project, run_dir): task for task in selected}
+            for future in as_completed(futures):
+                yield futures[future], future.result()
+
+
+def _run_tasks(tasks, config, project, run_dir):
+    deferred = {}
+    for task, failures in _run_tasks_once(tasks, config, project, run_dir):
+        if config.get("startup_deferred_retry", False):
+            for failure in failures:
+                root = run_dir / "workspaces" / task.id / failure["subject"]
+                if (failure["error_type"] == "JudgeError"
+                        and failure["message"] in {"OpenCode timed out after 180s", "OpenCode timed out before first event after 180s"}
+                        and not any(root.glob("*/checkpoints/atoms-*.json"))):
+                    deferred[task.id] = task
+        yield task, failures
+    # A bounded serial pass after other requests finish. Only unresolved
+    # startup failures qualify; _run_task still reuses valid locked results.
+    for task in deferred.values():
+        print(f"Retrying deferred startup failure for {task.id}", flush=True)
+        yield task, _run_task(task, config, project, run_dir)
 
 
 def main(argv=None):
@@ -85,30 +142,22 @@ def main(argv=None):
         return
     if args.command == "run":
         failures = []
-        for task in tasks:
-            for subject in config["subjects"]:
-                existing, _ = _results(config, run_dir, [task])
-                if (task.id, subject["id"]) in existing:
-                    print(f"Reusing {task.id} / {subject['name']}", flush=True)
-                    continue
-                print(f"Judging {task.id} / {subject['name']}", flush=True)
-                try:
-                    judge_task(task, subject["id"], config, project, run_dir)
-                except Exception as exc:
-                    # Retain all prior checkpoints and continue independent subjects/tasks.
-                    failure = {"task": task.id, "subject": subject["id"], "error_type": type(exc).__name__, "message": str(exc)}
-                    failures.append(failure)
-                    write_json(run_dir / "failures.json", failures)
-                    print(f"Incomplete {task.id} / {subject['name']}: {type(exc).__name__}: {exc}", flush=True)
+        summarized_dimensions = set()
+        for task, task_failures in _run_tasks(tasks, config, project, run_dir):
+            failures.extend(task_failures)
             result_map, _ = _results(config, run_dir, tasks)
+            failures = [failure for failure in failures
+                        if (failure["task"], failure["subject"]) not in result_map]
+            write_json(run_dir / "failures.json", failures)
             if all((task.id, subject["id"]) in result_map for subject in config["subjects"]):
                 locked = [result_map[(task.id, subject["id"])] for subject in config["subjects"]]
                 names = {subject["id"]: subject["name"] for subject in config["subjects"]}
                 name = "compare-result.md" if len(locked) > 1 else "evaluation-result.md"
-                (run_dir / "results" / task.id / name).write_text(task_markdown(task, locked, names), encoding="utf-8")
+                write_text(run_dir / "results" / task.id / name, task_markdown(task, locked, names))
             dimension_tasks = [item for item in tasks if item.dimension == task.dimension]
-            if all((item.id, subject["id"]) in result_map for item in dimension_tasks for subject in config["subjects"]):
+            if task.dimension not in summarized_dimensions and all((item.id, subject["id"]) in result_map for item in dimension_tasks for subject in config["subjects"]):
                 summaries(dimension_tasks, result_map, config, run_dir)
+                summarized_dimensions.add(task.dimension)
         write_json(run_dir / "failures.json", failures)
     result_map, missing = _results(config, run_dir, tasks)
     print(f"Completed: {len(result_map)}/{len(tasks) * len(config['subjects'])}; missing: {missing}", flush=True)

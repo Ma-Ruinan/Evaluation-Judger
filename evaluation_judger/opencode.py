@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from json_repair import repair_json
@@ -13,6 +14,59 @@ from json_repair import repair_json
 
 class JudgeError(RuntimeError):
     pass
+
+
+def _run_with_first_event_timeout(command, *, first_event_timeout, **kwargs):
+    """Bound silent startup without shortening an active streamed request."""
+    timeout = kwargs.pop("timeout")
+    on_output = kwargs.pop("on_output", None)
+    kwargs.pop("capture_output", None)
+    kwargs.pop("check", None)
+    output, diagnostics = [], []
+    ready = threading.Event()
+    started = time.monotonic()
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+
+    def stdout_reader():
+        try:
+            for line in process.stdout:
+                output.append(line)
+                if on_output:
+                    on_output(line)
+                if line.strip():
+                    ready.set()
+        finally:
+            ready.set()  # A process exiting without output must not wait.
+
+    def stderr_reader():
+        diagnostics.append(process.stderr.read())
+
+    readers = [threading.Thread(target=stdout_reader, daemon=True),
+               threading.Thread(target=stderr_reader, daemon=True)]
+    for reader in readers:
+        reader.start()
+    silent_timeout = False
+    first_wait = min(timeout, first_event_timeout)
+    try:
+        if not ready.wait(first_wait):
+            silent_timeout = True
+            raise subprocess.TimeoutExpired(command, first_wait)
+        process.wait(timeout=max(.001, timeout - (time.monotonic() - started)))
+    except subprocess.TimeoutExpired as exc:
+        process.kill()
+        process.wait()
+        for reader in readers:
+            reader.join(timeout=5)
+        exc.output, exc.stderr = "".join(output), "".join(diagnostics)
+        if silent_timeout:
+            exc.first_event_timeout = first_wait
+        raise
+    finally:
+        for reader in readers:
+            reader.join(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
+    return subprocess.CompletedProcess(command, process.returncode, "".join(output), "".join(diagnostics))
 
 
 def environment(project: Path) -> dict[str, str]:
@@ -64,7 +118,7 @@ def parse_events(raw: str) -> tuple[str, str | None, bool]:
     return "\n".join(texts).strip(), error, used_read
 
 
-def extract_json(text: str) -> dict:
+def extract_json(text: str, *, allow_array: bool = False) -> dict | list:
     block = re.search(r"BEGIN_JUDGMENT\s*(.*?)\s*END_JUDGMENT", text, re.S)
     payload = block.group(1) if block else text
     payload = re.sub(r"^```(?:json)?\s*|\s*```$", "", payload.strip(), flags=re.I)
@@ -75,6 +129,8 @@ def extract_json(text: str) -> dict:
             result = repair_json(payload, return_objects=True)
         except Exception as repair_error:
             raise JudgeError(f"Invalid JSON: {exc}; repair failed: {repair_error}") from exc
+    if allow_array and isinstance(result, list):
+        return result
     if not isinstance(result, dict):
         raise JudgeError("Expected JSON object")
     return result
@@ -112,7 +168,7 @@ class TaskSession:
                     self.session_id = saved["session_id"]
             except (OSError, ValueError, TypeError):
                 recover_events = True
-        if recover_events and workspace.name == fingerprint[:12]:
+        if recover_events and workspace.name in (fingerprint[:12], fingerprint[:12] + "-startup-1"):
             for event in sorted((workspace / "events").glob("atoms-*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True):
                 self.session_id = event_session(event)
                 if self.session_id:
@@ -133,7 +189,7 @@ class TaskSession:
                     temporary.replace(self.checkpoint)
 
 
-def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, model: str, timeout: int = 900, major: int = 1, *, session_id: str | None = None, _continue_length: bool = True) -> tuple[str, bool]:
+def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, model: str, timeout: int = 900, major: int = 1, *, session_id: str | None = None, _continue_length: bool = True, agent: str = "judge") -> tuple[str, bool]:
     env = environment(project)
     if timeout == 900:
         timeout = int(env.get("OPENCODE_REQUEST_TIMEOUT_SECONDS", "900"))
@@ -147,7 +203,7 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
         env["XDG_CONFIG_HOME"] = str(isolated / "config")
         env["XDG_CACHE_HOME"] = str(isolated / "cache")
     model_name, _, variant = model.partition("#")
-    command = [executable, "run", "--format", "json", "--agent", "judge", "--model", model_name, "--title", title]
+    command = [executable, "run", "--format", "json", "--agent", agent, "--model", model_name, "--title", title]
     if major == 2:
         command.insert(2, "--standalone")
     elif variant:
@@ -161,8 +217,22 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
         command += ["Read the attached UTF-8 prompt and follow it. Return only the requested JSON markers.", "--file", "prompt.txt"]
     else:
         command.append(prompt)
+    first_event_timeout = int(env.get("OPENCODE_FIRST_EVENT_TIMEOUT_SECONDS", "0"))
+    if first_event_timeout < 0:
+        raise JudgeError("OPENCODE_FIRST_EVENT_TIMEOUT_SECONDS must be nonnegative")
     try:
-        completed = subprocess.run(command, cwd=workspace, env=env, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, check=False)
+        invoke = subprocess.run if not first_event_timeout else _run_with_first_event_timeout
+        options = {"first_event_timeout": first_event_timeout} if first_event_timeout else {}
+        if first_event_timeout:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with output.open("w", encoding="utf-8") as live_events:
+                def persist_event(line):
+                    live_events.write(_clean(line, env))
+                    live_events.flush()
+                options["on_output"] = persist_event
+                completed = invoke(command, cwd=workspace, env=env, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, check=False, **options)
+        else:
+            completed = invoke(command, cwd=workspace, env=env, text=True, encoding="utf-8", errors="replace", capture_output=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         # subprocess still exposes output captured before the timeout. Preserve it
         # so a later run can salvage completed atom decisions.
@@ -171,6 +241,13 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
             partial = partial.decode("utf-8", errors="replace")
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(_clean(partial, env), encoding="utf-8")
+        diagnostics = exc.stderr or ""
+        if isinstance(diagnostics, bytes):
+            diagnostics = diagnostics.decode("utf-8", errors="replace")
+        if diagnostics:
+            output.with_suffix(".stderr.txt").write_text(_clean(diagnostics, env), encoding="utf-8")
+        if getattr(exc, "first_event_timeout", None):
+            raise JudgeError(f"OpenCode timed out before first event after {exc.first_event_timeout}s") from exc
         raise JudgeError(f"OpenCode timed out after {timeout}s") from exc
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(_clean(completed.stdout, env), encoding="utf-8")
@@ -201,7 +278,7 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
             "return the complete JSON between BEGIN_JUDGMENT and END_JUDGMENT, not just the missing suffix. "
             "Keep explanations specific and concise. Do not repeat source exploration already completed.",
             title + " finish judgment", continuation, project, model, timeout, major,
-            session_id=response_session, _continue_length=False)
+            session_id=response_session, _continue_length=False, agent=agent)
         return final_answer, used_read or more_read
     if length_limited:
         raise JudgeError("Response length limit reached before complete judgment text; retry a smaller atom group")
@@ -214,9 +291,37 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
 
 
 def probe(workspace: Path, project: Path, model: str, major: int = 1) -> None:
+    # Health checking only needs read, not grading instructions, web research,
+    # expensive reasoning or material-inspector execution. Preserve the same
+    # model family and exact workspace read whitelist; grading remains judge.
+    options = {}
+    config_file = workspace / "opencode.jsonc"
+    if config_file.exists():
+        config = json.loads(config_file.read_text(encoding="utf-8-sig"))
+        permissions = dict(config.get("agent", {}).get("judge", {}).get("permission", {}))
+        permissions.update({"edit": "deny", "bash": "deny", "question": "deny", "task": "deny", "webfetch": "deny", "external_directory": "deny", "material_inspector": "deny"})
+        config.setdefault("agent", {})["read-probe"] = {
+            "description": "Check a single authorized file read roundtrip.",
+            "mode": "primary", "temperature": 0,
+            "prompt": "Read the requested local file with the read tool and return only the requested short JSON. Do not evaluate submissions or research sources.",
+            "permission": permissions,
+        }
+        config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        options["agent"] = "read-probe"
+        model = model.partition("#")[0]
     nonce = f"probe-{time.time_ns()}"
     (workspace / "probe.txt").write_text(nonce, encoding="utf-8")
     prompt = 'Use the read tool to read probe.txt. Then return BEGIN_JUDGMENT\n{"nonce":"the exact contents of probe.txt"}\nEND_JUDGMENT. Do not guess.'
-    response, used_read = run(workspace, prompt, "judger read probe", workspace / "probe-events.jsonl", project, model, 180, major)
-    if extract_json(response).get("nonce") != nonce or not used_read:
-        raise JudgeError("OpenCode did not complete a read-tool roundtrip")
+    for attempt in range(2):
+        output = workspace / ("probe-events.jsonl" if attempt == 0 else "probe-events-retry.jsonl")
+        try:
+            response, used_read = run(workspace, prompt, "judger read probe", output, project, model, 180, major, **options)
+            if extract_json(response).get("nonce") != nonce or not used_read:
+                raise JudgeError("OpenCode did not complete a read-tool roundtrip")
+            return
+        except JudgeError:
+            if attempt == 1:
+                raise
+            # A new Windows workspace can occasionally stall before the model
+            # starts. Retry once; never mark the workspace ready without a
+            # successful tool roundtrip and exact nonce.

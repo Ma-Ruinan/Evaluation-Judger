@@ -5,12 +5,76 @@ from unittest.mock import patch
 
 from docx import Document
 
-from evaluation_judger.reporting import _facts, _fallback, compose_narrative, make_formal_report
+from evaluation_judger.reporting import _facts, _fallback, _validate_narrative, compose_narrative, make_formal_report
 import json
 from evaluation_judger.rubric import METRICS
+from evaluation_judger.charts import build_charts
+from evaluation_judger.opencode import JudgeError
 
 
 class LockedReport(TestCase):
+    def test_report_retries_one_silent_startup_and_reuses_saved_draft(self):
+        facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1,
+                 "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}}}
+        draft = _fallback(facts)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            calls = []
+            def model(workspace, prompt, title, output, *args, **kwargs):
+                calls.append((title, output))
+                output.write_text("", encoding="utf-8")
+                if len(calls) in (2, 3):
+                    raise JudgeError("OpenCode timed out before first event after 180s")
+                value = draft if len(calls) == 1 else {"ok": True, "issues": []}
+                return "BEGIN_JUDGMENT " + json.dumps(value, ensure_ascii=False) + " END_JUDGMENT", False
+            with patch("evaluation_judger.reporting.run", side_effect=model):
+                failed = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+                recovered = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+            self.assertEqual(failed["source"], "deterministic_fallback")
+            self.assertEqual(recovered["source"], "opencode")
+            self.assertEqual(len(calls), 4)
+            self.assertEqual(sum(title == "write locked evaluation report" for title, _ in calls), 1)
+            self.assertEqual(len({path for _, path in calls}), 4)
+
+    def test_real_report_rounded_scores_are_not_treated_as_invented_numbers(self):
+        facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1, "subjects": {},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}},
+                 "scores": ["4.903225806451612903225806452", "4.940149625935162094763092270",
+                            "4.962962962962962962962962963", "4.988746848645900487968510045",
+                            "4.99567437750176102182778261", "4.996078431372549019607843138"]}
+        draft = _fallback(facts)
+        draft["executive_summary"] = "以下分值是锁定结果的舍入表达，未重新评分：4.903、4.940、4.963、4.989、4.9957、4.9961。"
+        _validate_narrative(draft, facts)
+        for unsupported in ("4.904", "9.999"):
+            draft["executive_summary"] = f"以下分值并非锁定结果或其合法舍入，应当继续被程序拒绝：{unsupported}。"
+            with self.subTest(value=unsupported), self.assertRaisesRegex(ValueError, "numbers absent"):
+                _validate_narrative(draft, facts)
+
+    def test_report_retry_preserves_previous_events_and_archives_resolved_error(self):
+        facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1,
+                 "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}}}
+        draft = _fallback(facts)
+        def answer(value):
+            return "BEGIN_JUDGMENT " + json.dumps(value, ensure_ascii=False) + " END_JUDGMENT", False
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "reports/writer-workspace"
+            workspace.mkdir(parents=True)
+            original = workspace / "writer-events.jsonl"
+            original.write_text("previous attempt", encoding="utf-8")
+            error = root / "reports/narrative-error.json"
+            error.write_text('{"message":"previous validation error"}', encoding="utf-8")
+            with patch("evaluation_judger.reporting.run", side_effect=[answer(draft), answer({"ok": True, "issues": []})]) as model:
+                result = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+            self.assertEqual(result["source"], "opencode")
+            self.assertEqual(original.read_text(encoding="utf-8"), "previous attempt")
+            self.assertEqual(model.call_args_list[0].args[3].name, "writer-events-1.jsonl")
+            self.assertFalse(error.exists())
+            archived = root / "reports/attempt-history/narrative-error.json"
+            self.assertEqual(json.loads(archived.read_text(encoding="utf-8")), {"message": "previous validation error"})
+
     def test_review_findings_are_repaired_then_cached_without_rewriting(self):
         facts = {"dataset": "样例数据集", "task_count": 1, "dimension_count": 1,
                  "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
@@ -30,6 +94,18 @@ class LockedReport(TestCase):
             self.assertEqual(first, second)
             self.assertTrue((root / "reports/writer-draft.json").exists())
 
+    def test_thirty_task_figures_fit_page_slices_without_losing_numeric_ledger(self):
+        rows=[{"task_id":str(i),"subjects":{"a":{"scores":{"quality_mean":"2"}},"b":{"scores":{"quality_mean":"3"}}}} for i in range(30)]
+        facts={"task_count":30,"subjects":{sid:{"name":sid,"averages":{m:"2" for m in METRICS}} for sid in ("a","b")},
+               "dimensions":{"维度":{"tasks":[str(i) for i in range(30)],"task_results":rows,"subjects":{sid:{"scores":{"quality_mean":"2"}} for sid in ("a","b")}}}}
+        with TemporaryDirectory() as directory:
+            root=Path(directory);figures=build_charts(facts,root)
+            self.assertEqual(len(figures),4)
+            self.assertEqual([label for item in figures[2:] for label in item["labels"]],[str(i) for i in range(30)])
+            self.assertTrue(all(len(item["labels"])<=15 for item in figures[2:]))
+            ledger=json.loads((root/"charts/task-quality-difference.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["series"]["b"],["1"]*30)
+
     def test_formal_report_uses_locked_dimension_data(self):
         def scores(value):
             return {**{m: {"final": "100" if m == "completion" else value} for m in METRICS}, "quality_mean": value}
@@ -38,7 +114,7 @@ class LockedReport(TestCase):
         dimensions = {"维度一": {
             "tasks": ["1.1"],
             "task_results": [{"task_id": "1.1", "task_name": "样例题", "subjects": {"a": {"scores": scores("4"), "main_losses": []}, "b": {"scores": scores("3"), "main_losses": []}}}],
-            "subjects": {sid: {"process_stats": {"recorded_success_count": 1, "duration_count": 1, "mean_seconds": "60"}} for sid in ("a", "b")},
+            "subjects": {sid: {"scores": {**{m: '100' if m=='completion' else value for m in METRICS}, 'quality_mean': value}, "process_stats": {"recorded_success_count": 1, "duration_count": 1, "mean_seconds": "60"}} for sid,value in (("a",'4'), ("b",'3'))},
         }}
         with TemporaryDirectory() as directory:
             with patch("evaluation_judger.reporting.compose_narrative", side_effect=lambda facts, *_: _fallback(facts)):
@@ -49,3 +125,12 @@ class LockedReport(TestCase):
             self.assertIn("维度一", text)
             self.assertEqual(_facts(dimensions, config)["subjects"]["a"]["averages"]["quality_mean"], "4")
             self.assertIn("4.00", "\n".join(cell.text for table in doc.tables for row in table.rows for cell in row.cells))
+            self.assertNotIn('执行过程表现', text)
+            self.assertNotIn('process_stats', json.dumps(_facts(dimensions, config)))
+            plot = json.loads((Path(directory)/'reports/charts/task-quality-difference.json').read_text(encoding='utf-8'))
+            self.assertEqual(plot['series']['b'], ['-1'])
+            self.assertEqual(plot['baseline'], 'a')
+            self.assertEqual(len(doc.inline_shapes), 3)
+            self.assertIn('附录 逐题六项评分与对象差值', text)
+            self.assertTrue(all(p.paragraph_format.keep_with_next for row in doc.tables[-1].rows[1:3] for cell in row.cells for p in cell.paragraphs))
+            self.assertFalse(any(p.paragraph_format.keep_with_next for cell in doc.tables[-1].rows[3].cells for p in cell.paragraphs))

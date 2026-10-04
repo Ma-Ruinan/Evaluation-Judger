@@ -11,10 +11,10 @@ from openpyxl import load_workbook
 from pptx import Presentation
 from pypdf import PdfReader
 
-TEXT_EXT = {".txt", ".md", ".json", ".jsonl", ".csv", ".tsv", ".py", ".js", ".html", ".htm", ".css", ".xml", ".yaml", ".yml"}
+TEXT_EXT = {".txt", ".md", ".json", ".jsonl", ".csv", ".tsv", ".py", ".js", ".html", ".htm", ".css", ".xml", ".yaml", ".yml", ".go", ".ts", ".tsx", ".jsx", ".java", ".c", ".h", ".cpp", ".rs", ".sql", ".sh", ".ps1", ".toml"}
 
 
-def extract(path: Path, limit: int = 160_000) -> tuple[str, str | None]:
+def extract(path: Path, limit: int | None = 160_000) -> tuple[str, str | None]:
     """Return extracted text and an explicit extraction limitation, if any."""
     suffix = path.suffix.lower()
     try:
@@ -55,6 +55,6 @@ def extract(path: Path, limit: int = 160_000) -> tuple[str, str | None]:
             return "", f"Unsupported file type {suffix}; inspect original file separately"
     except Exception as exc:
         return "", f"Extraction failed: {type(exc).__name__}: {exc}"
-    if len(text) > limit:
+    if limit is not None and len(text) > limit:
         return text[:limit], f"Text truncated after {limit} characters; original file remains available"
     return text, None

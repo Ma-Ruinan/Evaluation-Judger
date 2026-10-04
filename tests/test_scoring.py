@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from evaluation_judger.rubric import METRICS, load_rubric, referenced_atoms, shared_sample_references
-from evaluation_judger.scoring import calculate, shared_items_match, validate_atom
+from evaluation_judger.scoring import calculate, shared_items_match, validate_atom, counting_notes
 from evaluation_judger.render import _atom_difference, _safe, _visible_items, duration_seconds, task_markdown
 from evaluation_judger.opencode import extract_json
 from evaluation_judger.judge import atom_batches, needs_time_review
@@ -13,6 +13,14 @@ from types import SimpleNamespace
 
 
 class ScoringContract(TestCase):
+    def test_excluded_sample_members_do_not_create_a_false_count_warning(self):
+        items = [{"claim": "qualitative", "result": 1}, {"claim": "contradiction", "result": 0},
+                 {"claim": "numeric", "result": "排除（数值由另一原子负责）"}]
+        self.assertEqual(counting_notes(items, 2), [])
+        notes = counting_notes(items[:1], 20)
+        self.assertTrue(notes)
+        self.assertNotIn("建议复核", notes[0])
+
     def test_display_rounding_does_not_block_authoritative_ratio(self):
         atom = SimpleNamespace(id="A01", kind="CLAIM-RATIO", metric="accuracy", weight=Decimal(100), rule="核验事实", purpose="准确性")
         raw = {"id": "A01", "state": "0.67", "numerator": 2, "denominator": 3,
@@ -24,6 +32,48 @@ class ScoringContract(TestCase):
         raw["state"] = 1
         with self.assertRaises(ValueError):
             validate_atom(raw, atom, {"delivery.md"})
+
+    def test_explicit_capped_count_preserves_observed_count_and_normal_ratio_guard(self):
+        atom = SimpleNamespace(id="T03", kind="RATIO", metric="completion", weight=Decimal(100),
+                               rule="**RATIO**：min(distinct_sources / 10, 1.0)", purpose="来源数")
+        raw = {"id": "T03", "state": 1, "numerator": 20, "denominator": 10,
+               "observation": "交付物中识别了二十个互不重复的来源。",
+               "reason": "二十个来源超过规则十条的满分目标，按明确的 min 公式封顶到一。",
+               "items": [{"element": str(i)} for i in range(20)],
+               "evidence": [{"file": "delivery.md", "locator": "来源", "quote": "来源清单"}]}
+        self.assertEqual(validate_atom(raw, atom, {"delivery.md"})["numerator"], 20)
+        raw["denominator"] = 20
+        with self.assertRaisesRegex(ValueError, "rubric target"):
+            validate_atom(raw, atom, {"delivery.md"})
+        raw["denominator"] = 10
+        atom.rule = "成功项/全部项"
+        with self.assertRaisesRegex(ValueError, "invalid ratio"):
+            validate_atom(raw, atom, {"delivery.md"})
+        atom.kind = "COUNT"; atom.rule = "**COUNT**：min(n,3)/3"
+        raw.update(state=1, numerator=4, denominator=3)
+        self.assertEqual(validate_atom(raw, atom, {"delivery.md"})["state"], "1")
+
+    def test_escaped_pipe_and_explicit_partial_zero_cap_keep_other_deliverable_scores(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "rubric.md"
+            text = self.rubric().replace("| T01 | test | 100 | completion", "| T01 | test | 40 | completion")
+            text = text.replace("## 7. 质量评分", "| T02 | test | 60 | 报告 | **BIN**：valid | report | REQ |\n## 7. 质量评分")
+            # The fixture uses a shorter section title; insert before the first 7.
+            if "| T02" not in text:
+                lines=text.splitlines(); index=next(i for i,line in enumerate(lines) if line.startswith("## 7."))
+                lines.insert(index, "| T02 | test | 60 | 报告 | **BIN**：valid | report | REQ |")
+                text="\n".join(lines)
+            text=text.replace("**BIN**：exists | file", r"**BIN**：包含 \|值\| | file", 1)
+            text=text.replace("| E01 | severe problem | 内容覆盖度：上限 1；原子 C01；准确率·忠实度：上限 1.5；原子 A01 |",
+                              "| E01 | 封顶范围仅限网站相关原子；报告不受影响 | 任务完成率：上限 0；原子 T01 |")
+            path.write_text(text,encoding="utf-8"); rubric=load_rubric(path)
+            self.assertIn("|值|",rubric.atoms[0].rule)
+            self.assertEqual(rubric.atoms[0].evidence,"file")
+            records=[{"id":a.id,"state":"1"} for a in rubric.atoms]
+            scores=calculate(rubric,records,[{"id":"E01","triggered":True}])
+            self.assertEqual(scores["completion"]["raw"],"100")
+            self.assertEqual(scores["completion"]["final"],"60")
+            self.assertEqual(scores["coverage"]["final"],"5")
 
     def test_sample_population_mismatch_is_reconciled_only_when_proven(self):
         atom = SimpleNamespace(id="H03", kind="CLAIM-RATIO", metric="hallucination", weight=Decimal(100),

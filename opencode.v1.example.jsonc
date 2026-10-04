@@ -6,13 +6,20 @@
     "aiaaa": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "AI AAA",
-      "options": {"baseURL": "https://aiaaa.cc/v1", "apiKey": "{env:AIAAA_API_KEY}"},
+      "options": {
+        "baseURL": "https://aiaaa.cc/v1",
+        "apiKey": "{env:AIAAA_API_KEY}"
+      },
       "models": {
         "deepseek-v4.1-flash": {
           "name": "DeepSeek V4.1 Flash",
-          "limit": {"context": 1000000, "output": 65536}
+          "limit": {
+            "context": 1000000,
+            "output": 65536
+          }
         }
       }
     }
-  }
+  },
+  "snapshot": false
 }

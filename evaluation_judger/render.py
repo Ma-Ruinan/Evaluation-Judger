@@ -14,7 +14,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 
 from .dataset import process_records
-from .judge import write_json
+from .judge import write_json, write_text
 from .rubric import LABELS, METRICS
 from .scoring import display, number
 
@@ -87,7 +87,8 @@ def _atom_difference(atom_records: list[dict], names: list[str]) -> str:
             examples = "、".join(_safe(_item_label(item) or item.get("source") or "核验项") for item in failed[:2])
             parts.append(f"{_safe(name)}：{len(failed)}项未通过，如{examples}")
         elif number(atom["state"]) == 1:
-            parts.append(f"{_safe(name)}：本项无失分")
+            observation = atom.get("observation") or atom.get("reason") or "本项满足规则"
+            parts.append(f"{_safe(name)}：{_safe(_short_reason(observation, 145))}")
         else:
             parts.append(f"{_safe(name)}：{_safe(_short_reason(atom.get('reason') or atom.get('observation', ''), 145))}")
     suffix = "。具体核验清单和判定见下文。" if left.get("items") and right.get("items") else "。"
@@ -103,6 +104,11 @@ def duration_seconds(value) -> int | None:
         h, m, s = (int(x or 0) for x in match.groups())
         return h * 3600 + m * 60 + s
     return None
+
+
+def _summary_text(value: str) -> str:
+    """Exclude embedded operational metadata from exported analytical prose."""
+    return re.sub(r'process-record\.json[^\n；;]*(?:runtime|status)\s*=[^\n；;]*[；;]?', '', str(value), flags=re.I).strip()
 
 
 def _short_reason(value: str, limit: int = 145) -> str:
@@ -144,7 +150,9 @@ def _loss_brief(atom: dict) -> str:
             examples.append(f"{name}（{location}）：{_short_reason(note, 85)}" if location else f"{name}：{_short_reason(note, 85)}")
         remainder = f"；另有 {len(failed) - 2} 项，详见逐题结果" if len(failed) > 2 else ""
         return f"{ratio}{'；'.join(examples)}{remainder}。"
-    return f"{ratio}{_short_reason(atom['reason'])}"
+    # A binary reason may explain a satisfied condition before the failed one.
+    # Preserve its full rationale rather than clipping away the actual finding.
+    return f"{ratio}{_summary_text(atom['reason'])}"
 
 
 def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
@@ -165,7 +173,9 @@ def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
         errors = [error for error in result["errors"] if error.get("triggered")]
         if errors:
             changes = [f"{LABELS[m]} {display(result['scores'][m]['raw'])} → {display(result['scores'][m]['final'])}"
-                       for m in METRICS if result["scores"][m]["caps"]]
+                       for m in METRICS if result["scores"][m]["caps"] or result["scores"][m].get("scoped_caps")]
+            changes += [f"{LABELS[m]}仅对 {'、'.join(scope['atoms'])} 应用局部上限 {scope['ceiling']}"
+                        for m in METRICS for scope in result['scores'][m].get('scoped_caps', [])]
             cap_notes.append(f"- {_safe(names[result['subject']])}：触发 {'、'.join(error['id'] for error in errors)}；{'；'.join(changes)}。具体依据见该对象的关键错误与封顶记录。")
     if cap_notes:
         lines += ["", "封顶说明：上表为应用关键错误上限后的最终分数。", "", *cap_notes, ""]
@@ -177,7 +187,8 @@ def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
             states = [display(a["state"]) for a in pair]
             if len(set(states)) == 1:
                 continue
-            summary = _atom_difference(pair, [names[r["subject"]] for r in results]) if len(results) == 2 else "分数见各对象逐项依据。"
+            summary = "；".join(_atom_difference([pair[0], pair[index]], [names[results[0]["subject"]], names[results[index]["subject"]]])
+                                 for index in range(1, len(results)) if number(pair[0]["state"]) != number(pair[index]["state"]))
             lines.append(f"| {rubric_atom.id}（{LABELS[rubric_atom.metric]}） | {' / '.join(states)} | {summary} |")
         lines.append("")
     for result in results:
@@ -210,7 +221,11 @@ def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
                     if omitted:
                         lines.append(f"- 其余 {omitted} 条核验项见完整 JSON；此处未省略已识别的未通过项。")
                     lines.append("")
-                for note in atom.get("validation_notes", []):
+                display_notes = atom.get("validation_notes", [])
+                if any(str(note).startswith("逐项清单共") for note in display_notes):
+                    from .scoring import counting_notes
+                    display_notes = counting_notes(atom.get("items", []), atom["denominator"])
+                for note in display_notes:
                     lines.append(f"- 记录检查：{_safe(note)}")
                 for correction in atom.get("record_corrections", []):
                     if isinstance(correction, dict):
@@ -222,10 +237,11 @@ def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
                     else:
                         detail = str(correction)
                     lines.append(f"- 记录修正：{_safe(detail)}")
-                if atom.get("validation_notes"):
+                if display_notes:
                     lines.append("")
                 for e in atom["evidence"]:
-                    lines.append(f"- 证据：`{_safe(e['file'])}` · {_safe(e['locator'])} · {_safe(e['quote'])}")
+                    content = ("视觉观察：" + e["description"] if e.get("kind") == "visual" and e.get("description") else e.get("quote", ""))
+                    lines.append(f"- 证据：`{_safe(e['file'])}` · {_safe(e['locator'])} · {_safe(content)}")
                 lines.append("")
         if result["errors"]:
             lines += ["### 关键错误与封顶", ""]
@@ -243,7 +259,7 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
         results = [result_map[(task.id, s["id"])] for s in config["subjects"]]
         by_dim[task.dimension].append((task, results))
         path = run_dir / "results" / task.id / ("compare-result.md" if len(results) > 1 else "evaluation-result.md")
-        path.write_text(task_markdown(task, results, names), encoding="utf-8")
+        write_text(path, task_markdown(task, results, names))
     dimensions = {}
     for dim, entries in by_dim.items():
         summary = {"dimension": dim, "tasks": [t.id for t, _ in entries], "subjects": {}, "task_results": [],
@@ -258,15 +274,32 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
                     "critical_errors": result["errors"],
                     "verification_scope": [{"atom_id": a["id"], "numerator": a["numerator"],
                                              "denominator": a["denominator"],
-                                             "scope_note": _short_reason(a["observation"], 500)}
+                                             "scope_note": _short_reason(_summary_text(a["observation"]), 500)}
                                             for a in result["atoms"] if a["kind"] == "CLAIM-RATIO"],
                     "fingerprint": result["fingerprint"],
                     "evidence_record": {"path": f"{task.id}/{result['subject']}.json",
                                         "sha256": hashlib.sha256((run_dir / "results" / task.id / f"{result['subject']}.json").read_bytes()).hexdigest()},
                 }
+            baseline = config['subjects'][0]['id']
+            row['differences'] = {s['id']: {m: str(number(row['subjects'][s['id']]['scores'][m]['final']) - number(row['subjects'][baseline]['scores'][m]['final'])) for m in METRICS} for s in config['subjects'][1:]}
+            for s in config['subjects'][1:]:
+                row['differences'][s['id']]['quality_mean'] = str(number(row['subjects'][s['id']]['scores']['quality_mean']) - number(row['subjects'][baseline]['scores']['quality_mean']))
             summary["task_results"].append(row)
         md = [f"# {_safe(dim)} 总评", "", f"纳入题目：{', '.join(summary['tasks'])}", "",
               f"评测模型：{_safe(summary['model'])}。统计：{summary['aggregation']}。", ""]
+        md += ['## 逐题六项分数与差异', '', '差值为后列对象减首列对象；完成率差值单位为百分点，其余为分。质量均分只平均五项质量指标。', '',
+               '| 题目 | 对象或差值 | ' + ' | '.join(LABELS[m] for m in METRICS) + ' | 质量均分 |',
+               '| --- | --- | ' + ' | '.join('---:' for _ in range(7)) + ' |']
+        for row in summary['task_results']:
+            for s in config['subjects']:
+                scores = row['subjects'][s['id']]['scores']
+                values = [display(scores[m]['final']) + ('%' if m == 'completion' else '') for m in METRICS]
+                md.append('| ' + row['task_id'] + ' | ' + _safe(s['name']) + ' | ' + ' | '.join(values + [display(scores['quality_mean'])]) + ' |')
+            for s in config['subjects'][1:]:
+                delta = row['differences'][s['id']]
+                md.append('| ' + row['task_id'] + ' | ' + _safe(s['name'] + ' − ' + config['subjects'][0]['name']) + ' | ' + ' | '.join(display(delta[m]) for m in (*METRICS, 'quality_mean')) + ' |')
+        md += ['']
+        archived_process = {'record_type': 'subject_test_excel', 'dimension': dim, 'subjects': {}}
         for s in config["subjects"]:
             sid = s["id"]
             rows = [next(r for r in results if r["subject"] == sid) for _, results in entries]
@@ -279,7 +312,8 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
             durations = [x for record in records if (x := duration_seconds(record.get("runtime"))) is not None]
             successes = sum("成功" in str(r.get("status", "")) and not any(term in str(r.get("status", "")) for term in ("不成功", "未成功", "失败")) for r in records)
             process_stats = {"duration_count": len(durations), "mean_seconds": str(Decimal(sum(durations)) / len(durations)) if durations else None, "recorded_success_count": successes}
-            summary["subjects"][sid] = {"name": s["name"], "scores": metric_scores, "process": records, "process_stats": process_stats}
+            summary["subjects"][sid] = {"name": s["name"], "scores": metric_scores}
+            archived_process['subjects'][sid] = {'name': s['name'], 'task_ids': summary['tasks'], 'records': records, 'statistics': process_stats}
             md += [f"## {_safe(s['name'])}", "", f"任务数：{len(rows)}。任务完成率 {display(metric_scores['completion'])}%；质量均分 {display(metric_scores['quality_mean'])} 分。", "", "| 指标 | 均分 |", "| --- | ---: |"]
             md += [f"| {LABELS[m]} | {display(metric_scores[m])}{'%' if m == 'completion' else ''} |" for m in METRICS]
             md += ["", "### 逐题结果", "", "| 题目 | 完成率 | 质量均分 | 主要失分项 |", "| --- | ---: | ---: | --- |"]
@@ -296,7 +330,7 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
             md += ["", "### 关键错误与封顶", ""]
             triggered = [(r, error) for r in rows for error in r["errors"] if error.get("triggered")]
             for result, error in triggered:
-                caps = "、".join(f"{LABELS[m]}最终 {display(result['scores'][m]['final'])}" for m in METRICS if result["scores"][m]["caps"])
+                caps = "、".join(f"{LABELS[m]}最终 {display(result['scores'][m]['final'])}" for m in METRICS if result["scores"][m]["caps"] or result["scores"][m].get("scoped_caps"))
                 md.append(f"- {result['task_id']}/{error['id']}：{_safe(error['reason'])} 封顶后的指标：{caps}。")
             if not triggered:
                 md.append("- 未触发关键错误封顶。")
@@ -305,9 +339,6 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
                 item = row["subjects"][sid]
                 record = item["evidence_record"]
                 md.append(f"- {row['task_id']}：[完整判分记录]({record['path']})；SHA-256 `{record['sha256']}`；输入指纹 `{item['fingerprint']}`。")
-            md += ["", "### 测试过程记录", ""]
-            md += [f"- {t.id}：用时 {_safe(process.get(t.id, {}).get(sid, {}).get('runtime', '未记录'))}；状态 {_safe(process.get(t.id, {}).get(sid, {}).get('status', '未记录'))}" for t, _ in entries]
-            md += ["", f"可解析用时 {process_stats['duration_count']}/{len(entries)} 题，平均 {display(process_stats['mean_seconds']) if process_stats['mean_seconds'] is not None else 'N/A'} 秒；过程表中标记成功 {process_stats['recorded_success_count']}/{len(entries)} 题。此处是执行记录统计，不参与质量分。"]
             md.append("")
         if len(config["subjects"]) > 1:
             base = config["subjects"][0]
@@ -316,7 +347,8 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
                 md.append("| " + (LABELS.get(metric) or "质量均分") + " | " + " | ".join(display(summary["subjects"][s["id"]]["scores"][metric]) for s in config["subjects"]) + " |")
             md += ["", "相对首列的质量均分差值：" + "；".join(f"{s['name']} {display(number(summary['subjects'][s['id']]['scores']['quality_mean']) - number(summary['subjects'][base['id']]['scores']['quality_mean']))}" for s in config["subjects"][1:]) + "。", ""]
         slug = entries[0][0].id.split(".")[0]
-        (run_dir / "results" / f"dimension-{slug}-summary.md").write_text("\n".join(md), encoding="utf-8")
+        write_json(run_dir / 'process-records' / f'dimension-{slug}-subject-tests.json', archived_process)
+        write_text(run_dir / "results" / f"dimension-{slug}-summary.md", "\n".join(md))
         write_json(run_dir / "results" / f"dimension-{slug}-summary.json", summary)
         dimensions[dim] = summary
     return dimensions
@@ -341,7 +373,7 @@ def make_report(config: dict, tasks, result_map: dict, dimensions: dict, run_dir
     doc.add_paragraph(config.get("report_title", "AI Agent 应用能力评测报告"), style="Title")
     doc.add_paragraph(f"数据集：{Path(config['dataset']).name}  |  纳入 {len(tasks)} 道题  |  受测对象 {len(config['subjects'])} 个")
     doc.add_heading("评测范围与方法", level=1)
-    doc.add_paragraph("本报告依据逐题 Rubric-Council 评分规则，对每个受测对象的交付独立判分。完成率与五项质量指标分别统计；各题等权，数据集统计直接平均题目原始分数。具体判分理由和证据见逐题结果文件。测试过程用时与运行状态取自过程记录表。")
+    doc.add_paragraph("本报告依据逐题 Rubric-Council 评分规则，对每个受测对象的交付独立判分。完成率与五项质量指标分别统计；各题等权，数据集统计直接平均题目原始分数。具体判分理由和证据见逐题结果文件。")
     doc.add_heading("总体结果", level=1)
     top_table = doc.add_table(rows=1, cols=3)
     top_table.style = "Table Grid"
@@ -379,8 +411,6 @@ def make_report(config: dict, tasks, result_map: dict, dimensions: dict, run_dir
             score = item["scores"]
             doc.add_heading(subject["name"], level=2)
             doc.add_paragraph(f"任务完成率 {display(score['completion'])}%；质量均分 {display(score['quality_mean'])} 分。")
-            stats = item["process_stats"]
-            doc.add_paragraph(f"过程记录：{stats['recorded_success_count']}/{len(summary['tasks'])} 题标记成功；可解析用时 {stats['duration_count']} 题，平均 {display(stats['mean_seconds']) if stats['mean_seconds'] is not None else 'N/A'} 秒。过程状态与交付评分分别统计。")
             weak = sorted(((t, a) for t in tasks if t.dimension == dim for a in result_map[(t.id, subject["id"])]["atoms"] if number(a["state"]) < 1), key=lambda pair: (number(pair[1]["state"]), -number(pair[1]["weight"])))[:3]
             if weak:
                 doc.add_paragraph("主要失分依据：")

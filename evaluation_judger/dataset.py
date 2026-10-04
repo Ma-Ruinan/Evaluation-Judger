@@ -105,7 +105,11 @@ def discover(config: dict) -> list[Task]:
             tasks.append(Task(task_id, match.group("name"), dim.name, folder, question, load_rubric(rubric_path), tuple(sources), {k: tuple(v) for k, v in deliveries.items()}))
     if not tasks:
         raise ValueError("No tasks found in configured scope")
-    return tasks
+    dimension_order = {int(digit): index for index, digit in enumerate(config.get("dimensions", []))}
+    def task_order(task):
+        dimension, question = (int(part) for part in task.id.split("."))
+        return dimension_order.get(dimension, dimension), question
+    return sorted(tasks, key=task_order)
 
 
 def process_records(config: dict) -> dict[str, dict[str, dict]]:
@@ -115,31 +119,68 @@ def process_records(config: dict) -> dict[str, dict[str, dict]]:
     if not file.is_file():
         raise ValueError("A process Excel file is required")
     wb = load_workbook(file, read_only=True, data_only=True)
-    sheet = wb[spec.get("sheet", wb.sheetnames[0])]
-    task_col = spec.get("task_column", "C")
-    columns = spec.get("subjects", {})
-    result: dict[str, dict[str, dict]] = {}
-    for row in range(spec.get("first_row", 3), sheet.max_row + 1):
-        raw = sheet[f"{task_col}{row}"].value
-        if raw is None:
-            continue
-        task_id = str(raw).strip()
-        if not re.fullmatch(r"\d+\.\d+", task_id):
-            continue
-        result[task_id] = {}
-        for subject in config["subjects"]:
-            col = columns.get(subject["id"], {})
-            if not col:
-                raise ValueError(f"Missing process columns for {subject['id']}")
-            result[task_id][subject["id"]] = {
-                "runtime": sheet[f"{col['runtime']}{row}"].value,
-                "status": sheet[f"{col['status']}{row}"].value,
-                "executed_at": sheet[f"{col['executed_at']}{row}"].value if col.get("executed_at") else config.get("execution_dates", {}).get(task_id, {}).get(subject["id"]),
-                "sheet": sheet.title,
-                "row": row,
-            }
-    wb.close()
-    return result
+    try:
+        sheet = wb[spec.get("sheet", wb.sheetnames[0])]
+        if sheet.max_row is None:
+            # Some exporters omit OOXML dimension metadata. Read the actual
+            # sheet bounds without changing the mandatory source workbook.
+            sheet.calculate_dimension(force=True)
+        task_col = spec.get("task_column", "C")
+        columns = spec.get("subjects", {})
+        task_id_map = spec.get("task_id_map", {})
+        if not isinstance(task_id_map, dict):
+            raise ValueError("process_excel.task_id_map must be an object")
+        result: dict[str, dict[str, dict]] = {}
+        for row in range(spec.get("first_row", 3), min(spec.get("last_row", sheet.max_row), sheet.max_row) + 1):
+            raw = sheet[f"{task_col}{row}"].value
+            if raw is None:
+                continue
+            task_label = str(raw).strip()
+            task_id = str(task_id_map.get(task_label, task_label)).strip()
+            if not re.fullmatch(r"\d+\.\d+", task_id):
+                continue
+            # Instruction/example sections may repeat a task ID without any
+            # participant data. They must not overwrite a genuine test record.
+            has_data = any(sheet[f"{col[key]}{row}"].value is not None
+                           for col in columns.values() for key in ("runtime", "status", "executed_at")
+                           if col.get(key))
+            if not has_data:
+                continue
+            if task_id in result:
+                raise ValueError(f"Duplicate process task {task_id} at {sheet.title}!{task_col}{row}")
+            result[task_id] = {}
+            for subject in config["subjects"]:
+                col = columns.get(subject["id"], {})
+                if not col:
+                    raise ValueError(f"Missing process columns for {subject['id']}")
+                result[task_id][subject["id"]] = {
+                    "runtime": sheet[f"{col['runtime']}{row}"].value,
+                    "status": sheet[f"{col['status']}{row}"].value,
+                    "executed_at": sheet[f"{col['executed_at']}{row}"].value if col.get("executed_at") else config.get("execution_dates", {}).get(task_id, {}).get(subject["id"]),
+                    "sheet": sheet.title,
+                    "row": row,
+                    "task_label": task_label,
+                }
+        return result
+    finally:
+        wb.close()
+
+
+def collection_task_codes(task_id: str, config: dict) -> list[str]:
+    aliases = config.get("process_excel", {}).get("task_id_map", {})
+    return sorted({task_id, *(str(key) for key, value in aliases.items() if str(value) == task_id)})
+
+
+def logical_delivery_name(name: str, task_id: str, subject_prefix: str, config: dict) -> str:
+    """Remove confirmed collection labels only; preserve physical file names."""
+    if not config.get("collection_prefixes_are_metadata", False) or not subject_prefix or not name.casefold().startswith(subject_prefix.casefold()):
+        return name
+    remainder = name[len(subject_prefix):]
+    for code in collection_task_codes(task_id, config):
+        if remainder.casefold().startswith((code + "-").casefold()):
+            remainder = remainder[len(code)+1:]
+            break
+    return remainder or name
 
 
 def task_fingerprint(task: Task, subject: str, config: dict) -> str:
@@ -150,4 +191,12 @@ def task_fingerprint(task: Task, subject: str, config: dict) -> str:
     if executed_at is not None:
         payload["execution_date"] = str(executed_at)
     payload["judge_version"] = "0.1"
+    if config.get("enable_image_input", False):
+        payload["image_input_version"] = "1"
+    if config.get("collection_prefixes_are_metadata", False):
+        prefix = next(s["prefix"] for s in config["subjects"] if s["id"] == subject)
+        payload["collection_naming"] = {"version": "1", "subject_prefix": prefix,
+                                        "task_codes": collection_task_codes(task.id, config)}
+    if "extraction_limit" in config:
+        payload["extraction_limit"] = config["extraction_limit"]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

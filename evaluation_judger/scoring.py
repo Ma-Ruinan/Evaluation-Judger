@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 import re
 import unicodedata
 
-from .rubric import METRICS, Rubric
+from .rubric import METRICS, Rubric, shared_sample_references
 
 
 def shared_items_match(source_items: list, target_items: list) -> bool:
@@ -45,6 +45,35 @@ def display(value) -> str:
     return str(number(value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def capped_count_target(rule: str) -> str | None:
+    """Recognize only the two explicit saturation formulas, never generic min."""
+    target = r"(?:\d+(?:\.\d+)?|[A-Za-z_]\w*)"
+    divided = re.search(rf"\bmin\s*\([^\n]*?/\s*({target})\s*[,，]\s*1(?:\.0+)?\s*\)", rule, re.I)
+    if divided:
+        return divided.group(1)
+    clipped = re.search(rf"\bmin\s*\([^\n]*[,，]\s*({target})\s*\)\s*/\s*({target})", rule, re.I)
+    if clipped and clipped.group(1) == clipped.group(2):
+        return clipped.group(1)
+    return None
+
+
+def counting_notes(items: list, denominator) -> list[str]:
+    """Explain grouped/excluded records without treating them as a schema failure."""
+    d = number(denominator)
+    if d <= 0 or d > 100 or d != d.to_integral_value() or len(items) == int(d):
+        return []
+    def excluded(item):
+        if not isinstance(item, dict):
+            return False
+        if item.get("included") is False or item.get("applicable") is False:
+            return True
+        label = str(item.get("result") or item.get("verdict") or "").strip().lower()
+        return bool(re.match(r"^(?:excluded\b|not_applicable\b|not applicable\b|n/a\b|排除(?:[（(:：]|$)|剔除(?:[（(:：]|$)|不计入(?:[（(:：]|$))", label))
+    if sum(not excluded(item) for item in items) == int(d):
+        return []
+    return [f"展示清单 {len(items)} 条，计分对象 {int(d)} 项；分组、排除等对应关系见本项计数依据和核验范围。"]
+
+
 def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
     record = dict(record)
     if record.get("id") != atom.id:
@@ -57,8 +86,13 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
     if not isinstance(evidence, list) or not evidence:
         raise ValueError(f"{atom.id}: missing evidence list")
     for entry in evidence:
-        if not isinstance(entry, dict) or not entry.get("file") or not entry.get("locator") or not entry.get("quote"):
-            raise ValueError(f"{atom.id}: evidence needs file, locator, quote")
+        if not isinstance(entry, dict) or not entry.get("file") or not entry.get("locator"):
+            raise ValueError(f"{atom.id}: evidence needs file, locator, quote or explicit visual description")
+        visual = (entry.get("kind") == "visual" and isinstance(entry.get("description"), str)
+                  and len(entry["description"].strip()) >= 8
+                  and str(entry["file"]).lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".html", ".htm", ".pptx", ".docx", ".pdf", ".xlsx")))
+        if not entry.get("quote") and not visual:
+            raise ValueError(f"{atom.id}: evidence needs a text quote or a located visual description")
         if entry["file"] not in known_files and not str(entry["file"]).startswith("https://"):
             raise ValueError(f"{atom.id}: unknown evidence file {entry['file']}")
     if atom.kind == "BIN":
@@ -86,7 +120,14 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
             record["record_corrections"] = [*record.get("record_corrections", []), correction]
             record["numerator"] = record["denominator"] = len(items)
             n = d = Decimal(len(items))
-        if d < 0 or n < 0 or n > d:
+        # Generated rubrics may explicitly cap counts at a fixed target:
+        # min(n / target, 1) or min(n, target) / target. This is not a
+        # success/total ratio; the observed count can legitimately exceed target.
+        count_target = capped_count_target(atom.rule) if atom.kind != "CLAIM-RATIO" else None
+        capped_count = count_target is not None
+        if count_target and re.fullmatch(r"\d+(?:\.\d+)?", count_target) and d != number(count_target):
+            raise ValueError(f"{atom.id}: count denominator must equal rubric target {count_target}")
+        if d < 0 or n < 0 or (n > d and not capped_count):
             raise ValueError(f"{atom.id}: invalid ratio {n}/{d}")
         if d == 0:
             if "空集合状态=1" in atom.rule or "空集" in atom.rule and "状态=1" in atom.rule:
@@ -94,15 +135,15 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
             else:
                 state = Decimal(0)
         else:
-            state = n / d
+            state = min(n / d, Decimal(1)) if capped_count else n / d
         given = number(record.get("state"))
         if abs(state - given) > Decimal("0.005"):
-            raise ValueError(f"{atom.id}: stated state {given} differs from {n}/{d}")
+            raise ValueError(f"{atom.id}: stated state {given} differs from computed {state} ({n}/{d}, capped={capped_count})")
         if not isinstance(record.get("items"), list) or (d > 0 and not record["items"]):
             raise ValueError(f"{atom.id}: ratio requires itemized checks")
         notes = []
-        if d == d.to_integral_value() and d <= 100 and len(record["items"]) != int(d):
-            notes.append(f"逐项清单共 {len(record['items'])} 条，分母为 {int(d)}；存在合并记录，建议复核明细覆盖范围")
+        if not capped_count:
+            notes = counting_notes(record["items"], d)
     if atom.kind == "BIN":
         notes = []
     return {
@@ -125,7 +166,42 @@ def calculate(rubric: Rubric, records: list[dict], errors: list[dict]) -> dict:
     for metric in METRICS:
         raw = sum((a.weight * number(indexed[a.id]["state"]) for a in rubric.by_metric(metric)), Decimal(0))
         raw = raw if metric == "completion" else raw / Decimal(20)
-        caps = [number(cap) for e in errors if e.get("triggered") for cap in [next((rule.caps[metric] for rule in rubric.errors if rule.id == e["id"] and metric in rule.caps), None)] if cap is not None]
-        scores[metric] = {"raw": str(raw), "final": str(min([raw, *caps])), "caps": [str(c) for c in caps]}
+        rules = [rule for e in errors if e.get("triggered") for rule in rubric.errors if rule.id == e["id"] and metric in rule.caps]
+        caps = [number(rule.caps[metric]) for rule in rules if metric not in rule.atom_scopes]
+        # Scoped zero caps remove only the explicitly named atoms. Preserve
+        # other deliverables' contributions in the same metric.
+        scoped = [rule for rule in rules if metric in rule.atom_scopes]
+        contributions = {a.id: a.weight * number(indexed[a.id]["state"]) / (1 if metric == "completion" else Decimal(20)) for a in rubric.by_metric(metric)}
+        if any(number(rule.caps[metric]) != 0 for rule in scoped):
+            raise ValueError("Nonzero scoped cap requires an explicit atom-level score formula")
+        for rule in scoped:
+            for identifier in rule.atom_scopes[metric]:
+                contributions[identifier] = Decimal(0)
+        final = min([sum(contributions.values(), Decimal(0)), *caps]) if scoped else min([raw, *caps])
+        scores[metric] = {"raw": str(raw), "final": str(final), "caps": [str(c) for c in caps]}
+        if scoped:
+            scores[metric]["scoped_caps"] = [{"error": rule.id, "ceiling": str(rule.caps[metric]), "atoms": list(rule.atom_scopes[metric])} for rule in scoped]
     scores["quality_mean"] = str(sum((number(scores[m]["final"]) for m in METRICS[1:]), Decimal(0)) / 5)
     return scores
+
+
+def result_is_consistent(task, result: dict) -> bool:
+    try:
+        records = result["atoms"]
+        indexed = {r["id"]: r for r in records}
+        if len(indexed) != len(task.rubric.atoms):
+            return False
+        if calculate(task.rubric, records, result["errors"]) != result["scores"]:
+            return False
+        if any(len(shared_sample_references(atom.rule)) > 1 for atom in task.rubric.atoms) and result.get("multi_sample_review_version") != 3:
+            return False
+        for atom in task.rubric.atoms:
+            references = shared_sample_references(atom.rule)
+            if len(references) == 1 and references[0] in indexed and atom.kind in ("RATIO", "CLAIM-RATIO"):
+                source, target = indexed[references[0]], indexed[atom.id]
+                required = int(source["denominator"])
+                if int(target["denominator"]) != required or len(source["items"]) != required or len(target["items"]) != required or not shared_items_match(source["items"], target["items"]):
+                    return False
+        return True
+    except (KeyError, ValueError, TypeError):
+        return False
