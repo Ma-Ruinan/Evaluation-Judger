@@ -191,6 +191,11 @@ def task_fingerprint(task: Task, subject: str, config: dict) -> str:
     if executed_at is not None:
         payload["execution_date"] = str(executed_at)
     payload["judge_version"] = "0.1"
+    if "temperature" in config:
+        temperature = config["temperature"]
+        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
+            raise ValueError("temperature must be a finite number in 0-2")
+        payload["temperature"] = temperature
     if config.get("enable_image_input", False):
         payload["image_input_version"] = "1"
     if config.get("collection_prefixes_are_metadata", False):

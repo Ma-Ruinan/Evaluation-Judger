@@ -76,10 +76,44 @@ def _validate_narrative(result: dict, facts: dict) -> None:
 
 def _facts(dimensions: dict, config: dict) -> dict:
     dimensions = json.loads(json.dumps(dimensions, ensure_ascii=False, default=str))
+    baseline_id = config['subjects'][0]['id']
     for dimension in dimensions.values():
         for subject in dimension.get('subjects', {}).values():
             subject.pop('process', None)
             subject.pop('process_stats', None)
+        baseline_scores = dimension['subjects'][baseline_id]['scores']
+        dimension['differences'] = {
+            subject['id']: {
+                metric: str(number(dimension['subjects'][subject['id']]['scores'][metric])
+                            - number(baseline_scores[metric]))
+                for metric in (*METRICS, 'quality_mean')
+            }
+            for subject in config['subjects'][1:]
+        }
+        dimension['display_differences'] = {
+            sid: {metric: display(value) for metric, value in values.items()}
+            for sid, values in dimension['differences'].items()
+        }
+        dimension['task_difference_extrema'] = {}
+        for subject in config['subjects'][1:]:
+            sid = subject['id']
+            extrema = {}
+            for metric in (*METRICS, 'quality_mean'):
+                differences = {}
+                for row in dimension['task_results']:
+                    current = row['subjects'][sid]['scores'][metric]
+                    baseline_value = row['subjects'][baseline_id]['scores'][metric]
+                    differences[row['task_id']] = number(current if metric == 'quality_mean' else current['final']) - number(baseline_value if metric == 'quality_mean' else baseline_value['final'])
+                largest = max(abs(value) for value in differences.values())
+                extrema[metric] = {
+                    'largest_absolute_difference': str(largest),
+                    'display_largest_absolute_difference': display(largest),
+                    'task_ids': [task_id for task_id,value in differences.items() if abs(value) == largest],
+                    'positive_task_ids': [task_id for task_id,value in differences.items() if value > 0],
+                    'negative_task_ids': [task_id for task_id,value in differences.items() if value < 0],
+                    'equal_task_ids': [task_id for task_id,value in differences.items() if value == 0],
+                }
+            dimension['task_difference_extrema'][sid] = extrema
         for row in dimension.get('task_results', []):
             for subject in row['subjects'].values():
                 for entry in subject.get('verification_scope', []):
@@ -145,6 +179,41 @@ def _report_request(workspace: Path, prompt: str, title: str, stem: str, project
             print(f"Retrying report stage after silent startup: {title}", flush=True)
 
 
+def _checked_narrative(result: dict, facts: dict, workspace: Path, project: Path,
+                       model: str, major: int, digest: str, stage: str) -> dict:
+    """Repair one rejected prose candidate without relaxing the fact gate."""
+    for attempt in range(2):
+        try:
+            _validate_narrative(result, facts)
+            return result
+        except (ValueError, KeyError, TypeError) as exc:
+            write_json(_unused_path(workspace.parent / 'attempt-history',
+                                    stage + '-rejected-draft', '.json'),
+                       {'facts_hash': digest, 'draft': result,
+                        'validation_error': str(exc)})
+            if attempt:
+                raise
+            prompt = (
+                "Correct ONLY the validation problems in this Chinese report prose. "
+                "Read locked-facts.json in THIS workspace in segments, including the "
+                "relevant task rows and differences. Scores are locked: do not rescore "
+                "deliveries or alter facts. Use the locked display averages/differences "
+                "and task differences rather than subtracting rounded table values. "
+                "Remove an unnecessary unsupported number instead of inventing one. "
+                "Preserve the report scope, evidence attributions and JSON keys "
+                "executive_summary, comparison, limitations, conclusion and "
+                "dimension_analysis. Return BEGIN_JUDGMENT then the complete corrected "
+                "JSON then END_JUDGMENT. Validation diagnostic: " + str(exc)
+                + ". Draft: " + json.dumps(result, ensure_ascii=False)
+            )
+            answer, _ = _report_request(workspace, prompt,
+                                       'repair report validation ' + stage,
+                                       stage + '-validation-repair-events',
+                                       project, model, major)
+            result = extract_json(answer)
+    raise AssertionError('Unreachable bounded narrative validation state')
+
+
 def compose_narrative(facts: dict, config: dict, project: Path, run_dir: Path) -> dict:
     """Use OpenCode for prose; failures leave scores and a usable report intact."""
     report_dir = run_dir / "reports"
@@ -169,6 +238,7 @@ def compose_narrative(facts: dict, config: dict, project: Path, run_dir: Path) -
     prompt = f"""Write the ANALYTIC PROSE for a Chinese AI Agent evaluation report from the locked facts below. Do not score deliveries again. All five quality scores are better when higher; hallucination/self-consistency score measures fewer hallucinations and greater consistency, not hallucination frequency. Follow the Report-Generator principles: executive summary, scope-aware dimension analysis, object comparison, limitations and conclusion. Every concrete difference must cite a dimension/task/atom from the facts. Do not invent task results, numerical values, causes, significance or source claims. A task with no substantive answer may retain nonzero quality scores under explicit empty-set/no-fabrication rubric rules. Such points do not establish completion or useful delivered content; explain completion and quality separately where relevant. For error caps, describe ONLY the concrete finding that triggered the rule: a rule listing several possible error categories does not mean all categories occurred. This may be a subset of the dataset, so state the exact scope. Do not include execution time, runtime status, evaluator operation, success-rate or stability analysis: those records are archived separately and outside this report. Use tables and charts for numbers, prose for specific evidence-backed differences. Avoid internal field names. Keep the executive summary around 150-300 Chinese characters; each dimension analysis around 250-500, other sections around 100-350 as evidence permits. Do not repeat full score vectors in every section: the report tables already show all metrics. Use connected paragraphs in formal Chinese plain prose without Markdown syntax. Return BEGIN_JUDGMENT then a JSON object with keys executive_summary, comparison, limitations, conclusion, dimension_analysis (object keyed by each exact dimension name), then END_JUDGMENT. Facts: read locked-facts.json in THIS workspace using the read tool. It contains the complete locked table as formatted JSON. Read overall scope and scores, then each dimension and its task evidence in segments; continue past any read output cutoff. Do not read outside this workspace or reconstruct judgments from deliveries."""
     prompt = "Distinguish a metric ceiling from the final score: final=min(raw, applicable ceilings). A triggered ceiling does not reduce a raw score already below it. Never call that unchanged score a reduction caused by the cap. An explicit atom-scoped zero cap removes only the listed atoms' contributions and preserves the other atoms in that metric; see scoped_caps if present. " + prompt
     prompt += " Prefer two decimal places for score prose, matching the tables. If finer precision is needed to explain a small difference, use at most six decimal places and ROUND_HALF_UP from the locked value."
+    prompt += " Use task_difference_extrema for any largest-gap claim and name the metric; respect all ties. Do not call a salient example the largest by intuition. Bind each source-access limitation and each loss cause to its exact task and participant. Avoid exclusive claims such as 'only caused by' unless every recorded loss is covered. Keep the configured baseline for signed differences consistent."
     try:
         draft_checkpoint = report_dir / "writer-draft.json"
         saved_draft = json.loads(draft_checkpoint.read_text(encoding="utf-8")) if draft_checkpoint.exists() else {}
@@ -177,13 +247,31 @@ def compose_narrative(facts: dict, config: dict, project: Path, run_dir: Path) -
         else:
             answer, _ = _report_request(workspace, prompt, "write locked evaluation report", "writer-events", project, config.get("model", "aiaaa/deepseek-v4.1-flash#high"), major)
             result = extract_json(answer)
-        _validate_narrative(result, facts)
         write_json(draft_checkpoint, {"facts_hash": digest, "draft": result})
+        result = _checked_narrative(result, facts, workspace, project,
+                                    config.get("model", "aiaaa/deepseek-v4.1-flash#high"),
+                                    major, digest, 'writer')
+        write_json(draft_checkpoint, {"facts_hash": digest, "draft": result})
+        review_checkpoint = report_dir / 'narrative-review.json'
+        saved_review = json.loads(review_checkpoint.read_text(encoding='utf-8')) if review_checkpoint.exists() else {}
         for review_attempt in range(2):
             review_prompt = f"""Act as an independent reviewer of report prose. Compare the draft ONLY against the locked fact table. Check every number, subject mapping, dimension/task/atom attribution, scope limitation and whether any causal or broad superiority claim exceeds the evidence. Do not rescore deliveries. Nonzero quality from explicit empty-set/no-fabrication rules does not prove substantive task completion. Return BEGIN_JUDGMENT then JSON {{"ok":true/false,"issues":[...]}} then END_JUDGMENT. Facts: read locked-facts.json in THIS workspace using the read tool. It contains the complete locked table as formatted JSON. Read overall scope and scores, then each dimension and its task evidence in segments; continue past any read output cutoff. Do not read outside this workspace or reconstruct judgments from deliveries.. Draft: {json.dumps(result, ensure_ascii=False, indent=2)}"""
             review_prompt += " Also explicitly check cap ceilings against raw and final scores: a triggered ceiling above the raw score leaves the score unchanged and cannot be described as causing a reduction."
-            review_answer, _ = _report_request(workspace, review_prompt, "audit locked evaluation report", f"review-{review_attempt}-events", project, config.get("model", "aiaaa/deepseek-v4.1-flash#high"), major)
-            review = extract_json(review_answer)
+            review_prompt += " Review every prose section in the first pass, including largest-gap claims against task_difference_extrema, exact task/participant attribution of access limitations, exclusive causal claims, and signed-difference direction. List all concrete issues found."
+            review_prompt += " Separate material factual/numerical contradictions, misattributions and unsupported conclusions from optional wording precision or style. Put ONLY blocking issues in issues; put optional preferences in suggestions. Set ok=true when no blocking issue remains. A conservative 'many' description where the facts say 'all' is not by itself a contradiction and must not block the report. Do not require exhaustive loss lists unless the prose claims to be exclusive."
+            draft_hash = hashlib.sha256(json.dumps(result, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+            if (review_attempt == 0 and saved_review.get('ok') is False
+                    and saved_review.get('facts_hash') == digest
+                    and saved_review.get('draft_hash') == draft_hash):
+                review = saved_review
+            else:
+                review_answer, _ = _report_request(workspace, review_prompt, "audit locked evaluation report", f"review-{review_attempt}-events", project, config.get("model", "aiaaa/deepseek-v4.1-flash#high"), major)
+                review = extract_json(review_answer)
+            review = dict(review, facts_hash=digest, draft_hash=draft_hash)
+            if review_checkpoint.exists():
+                previous = json.loads(review_checkpoint.read_text(encoding='utf-8'))
+                if previous != review:
+                    write_json(_unused_path(report_dir / 'attempt-history', 'narrative-review', '.json'), previous)
             write_json(report_dir / f"narrative-review-{review_attempt}.json", review)
             write_json(report_dir / "narrative-review.json", review)
             if review.get("ok") is True:
@@ -191,9 +279,14 @@ def compose_narrative(facts: dict, config: dict, project: Path, run_dir: Path) -
             if review_attempt == 1:
                 raise ValueError(f"Independent report review found issues: {review.get('issues')}")
             repair_prompt = f"""Revise this Chinese report prose to resolve ONLY the independent review issues. Keep the same JSON keys and all locked scores. Do not infer new errors from a rubric's possible error categories: describe only findings actually recorded. Return BEGIN_JUDGMENT then the complete revised JSON then END_JUDGMENT. Facts: read locked-facts.json in THIS workspace using the read tool. It contains the complete locked table as formatted JSON. Read overall scope and scores, then each dimension and its task evidence in segments; continue past any read output cutoff. Do not read outside this workspace or reconstruct judgments from deliveries.. Draft: {json.dumps(result, ensure_ascii=False, indent=2)}. Issues: {json.dumps(review.get('issues'), ensure_ascii=False, indent=2)}"""
+            repair_prompt += " Cross-check any remaining largest-gap statement against the program's task_difference_extrema, and verify task/participant mappings for source limitations. Do not introduce a new unsupported comparison while fixing another one."
+            repair_prompt += " Prefer simple accurate wording. For a ratio whose numerator counts supported or non-fabricated items, distinguish that numerator from the complementary defect count; do not describe the complement as a subset of the numerator. Remove unnecessary ambiguous detail rather than adding new claims."
             repaired, _ = _report_request(workspace, repair_prompt, "repair reviewed report prose", "writer-repair-events", project, config.get("model", "aiaaa/deepseek-v4.1-flash#high"), major)
             result = extract_json(repaired)
-            _validate_narrative(result, facts)
+            write_json(draft_checkpoint, {"facts_hash": digest, "draft": result})
+            result = _checked_narrative(result, facts, workspace, project,
+                                        config.get("model", "aiaaa/deepseek-v4.1-flash#high"),
+                                        major, digest, 'review-repair')
             write_json(draft_checkpoint, {"facts_hash": digest, "draft": result})
         result["source"] = "opencode"
         prior_error = report_dir / "narrative-error.json"

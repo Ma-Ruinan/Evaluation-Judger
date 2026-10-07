@@ -13,6 +13,119 @@ from evaluation_judger.opencode import JudgeError
 
 
 class LockedReport(TestCase):
+    def test_final_failed_review_resumes_its_issues_before_a_new_audit(self):
+        facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1,
+                 "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}}}
+        draft = _fallback(facts)
+        def answer(value):
+            return "BEGIN_JUDGMENT " + json.dumps(value, ensure_ascii=False) + " END_JUDGMENT", False
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            responses = [answer(draft),answer({'ok':False,'issues':['首次意见']}),
+                         answer(draft),answer({'ok':False,'issues':['最后意见：最大差距归属错误']})]
+            with patch('evaluation_judger.reporting.run',side_effect=responses):
+                failed = compose_narrative(facts,{},Path(__file__).resolve().parent.parent,root)
+            self.assertEqual(failed['source'],'deterministic_fallback')
+            review = json.loads((root/'reports/narrative-review.json').read_text(encoding='utf-8'))
+            self.assertIn('facts_hash',review)
+            self.assertIn('draft_hash',review)
+            with patch('evaluation_judger.reporting.run',side_effect=[answer(draft),answer({'ok':True,'issues':[]})]) as model:
+                recovered = compose_narrative(facts,{},Path(__file__).resolve().parent.parent,root)
+            self.assertEqual(recovered['source'],'opencode')
+            self.assertEqual(model.call_count,2)
+            self.assertEqual(model.call_args_list[0].args[2],'repair reviewed report prose')
+            self.assertIn('最后意见',model.call_args_list[0].args[1])
+            self.assertTrue(list((root/'reports/attempt-history').glob('narrative-review*.json')))
+
+    def test_difference_extrema_use_raw_values_and_preserve_ties(self):
+        def scores(value):
+            return {**{m:{'final':'100' if m=='completion' else value} for m in METRICS},'quality_mean':value}
+        rows = [{'task_id':tid,'subjects':{'a':{'scores':scores(a)},'b':{'scores':scores(b)}}}
+                for tid,a,b in [('1.1','3','4.063'),('1.2','3','4.3225'),('1.3','4.3225','3')]]
+        dims={'维度一':{'tasks':[r['task_id'] for r in rows],'task_results':rows,
+             'subjects':{sid:{'scores':{**{m:'100' if m=='completion' else '4' for m in METRICS},'quality_mean':'4'}} for sid in ('a','b')}}}
+        facts=_facts(dims,{'dataset':'.','subjects':[{'id':'a','name':'甲'},{'id':'b','name':'乙'}]})
+        extrema=facts['dimensions']['维度一']['task_difference_extrema']['b']['quality_mean']
+        self.assertEqual(extrema['largest_absolute_difference'],'1.3225')
+        self.assertEqual(extrema['task_ids'],['1.2','1.3'])
+        self.assertEqual(extrema['positive_task_ids'],['1.1','1.2'])
+        self.assertEqual(extrema['negative_task_ids'],['1.3'])
+
+    def test_dimension_mean_differences_are_locked_before_prose_validation(self):
+        from decimal import Decimal
+        sets = [
+            ({'coverage':'4.944','accuracy':'3.3','format':'5','structure':'5','hallucination':'3.523'},
+             {'coverage':'5','accuracy':'4.402','format':'5','structure':'5','hallucination':'4.750'}),
+            ({'coverage':'5','accuracy':'4.6','format':'4.5','structure':'5','hallucination':'4.13'},
+             {'coverage':'5','accuracy':'4.671','format':'5','structure':'4.5','hallucination':'4.39'}),
+        ]
+        dimensions = {}
+        for index,(a,b) in enumerate(sets,1):
+            subjects, rows = {}, {}
+            for sid,values in [('a',a),('b',b)]:
+                scores = {'completion':'100',**values,'quality_mean':str(sum(Decimal(v) for v in values.values())/5)}
+                subjects[sid] = {'scores':scores}
+                rows[sid] = {'scores':{**{m:{'final':scores[m]} for m in METRICS},'quality_mean':scores['quality_mean']}}
+            dimensions[f'维度{index}'] = {'tasks':[f'{index}.1'],'subjects':subjects,'task_results':[{'task_id':f'{index}.1','subjects':rows}]}
+        facts = _facts(dimensions, {'dataset':'.','subjects':[{'id':'a','name':'甲'},{'id':'b','name':'乙'}]})
+        first = facts['dimensions']['维度1']['display_differences']['b']
+        second = facts['dimensions']['维度2']['display_differences']['b']
+        self.assertEqual(first['hallucination'], '1.23')
+        self.assertEqual(first['quality_mean'], '0.48')
+        self.assertEqual(second['hallucination'], '0.26')
+        self.assertEqual(second['quality_mean'], '0.07')
+        self.assertNotIn('differences', dimensions['维度1'])
+        draft = _fallback(facts)
+        draft['comparison'] = '维度差值按未舍入锁定数值计算，合法显示为 1.23、0.48、0.26 和 0.07，而不是另行重新评分。'
+        _validate_narrative(draft, facts)
+        draft['comparison'] += ' 不应接受没有来源的 9.999。'
+        with self.assertRaisesRegex(ValueError, 'numbers absent'):
+            _validate_narrative(draft, facts)
+
+    def test_invalid_numbers_are_repaired_before_independent_review(self):
+        facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1,
+                 "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}}}
+        valid = _fallback(facts)
+        invalid = dict(valid, comparison="此处差值 0.07 未包含在锁定事实中，必须由程序拒绝并纠错，不能作为报告发布。")
+        def answer(value):
+            return "BEGIN_JUDGMENT " + json.dumps(value, ensure_ascii=False) + " END_JUDGMENT", False
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("evaluation_judger.reporting.run", side_effect=[answer(invalid), answer(valid), answer({"ok": True, "issues": []})]) as model:
+                result = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+                again = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+            self.assertEqual(result["source"], "opencode")
+            self.assertEqual(result, again)
+            self.assertEqual(model.call_count, 3)
+            self.assertIn("0.07", model.call_args_list[1].args[1])
+            self.assertEqual(model.call_args_list[2].args[2], "audit locked evaluation report")
+            rejected = json.loads((root / "reports/attempt-history/writer-rejected-draft.json").read_text(encoding="utf-8"))
+            self.assertEqual(rejected["draft"], invalid)
+            self.assertIn("numbers absent", rejected["validation_error"])
+
+    def test_numeric_repair_is_bounded_and_resumes_the_bound_draft(self):
+        facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1,
+                 "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},
+                 "dimensions": {"维度一": {"tasks": ["1.1"]}}}
+        valid = _fallback(facts)
+        invalid = dict(valid, comparison="此处虚构了不存在于事实表的 9.999 分，应拒绝；有限纠错失败必须保留草稿并停止该阶段。")
+        def answer(value):
+            return "BEGIN_JUDGMENT " + json.dumps(value, ensure_ascii=False) + " END_JUDGMENT", False
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("evaluation_judger.reporting.run", side_effect=[answer(invalid), answer(invalid)]) as model:
+                failed = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+            self.assertEqual(failed["source"], "deterministic_fallback")
+            self.assertEqual(model.call_count, 2)
+            self.assertEqual(len(list((root / "reports/attempt-history").glob('writer-rejected-draft*.json'))), 2)
+            with patch("evaluation_judger.reporting.run", side_effect=[answer(valid), answer({"ok": True, "issues": []})]) as model:
+                recovered = compose_narrative(facts, {}, Path(__file__).resolve().parent.parent, root)
+            self.assertEqual(recovered["source"], "opencode")
+            self.assertEqual(model.call_count, 2)
+            self.assertTrue(model.call_args_list[0].args[2].startswith('repair report validation'))
+
     def test_report_retries_one_silent_startup_and_reuses_saved_draft(self):
         facts = {"dataset": "样例", "task_count": 1, "dimension_count": 1,
                  "subjects": {"a": {"name": "甲", "averages": {"completion": "100", "quality_mean": "4"}}},

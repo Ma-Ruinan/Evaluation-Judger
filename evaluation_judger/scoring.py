@@ -5,8 +5,28 @@ from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 import re
 import unicodedata
+from urllib.parse import urlsplit
 
 from .rubric import METRICS, Rubric, shared_sample_references
+
+
+def is_source_url(value) -> bool:
+    """Accept authentic HTTP(S) citation schemes without rewriting the evidence."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        return parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def claim_label(item: dict) -> str:
+    """Read semantic claim text from supported response aliases, never locators/IDs."""
+    if not isinstance(item, dict):
+        return ""
+    return str(next((item[key] for key in ("claim", "element", "statement", "subject", "item", "name")
+                     if item.get(key)), ""))
 
 
 def shared_items_match(source_items: list, target_items: list) -> bool:
@@ -16,8 +36,8 @@ def shared_items_match(source_items: list, target_items: list) -> bool:
     for source, target in zip(source_items, target_items):
         if not isinstance(source, dict) or not isinstance(target, dict):
             return False
-        left = source.get("claim") or source.get("element") or source.get("statement")
-        right = target.get("claim") or target.get("element") or target.get("statement")
+        left = claim_label(source)
+        right = claim_label(target)
         if not left or not right:
             return False
         left = re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", str(left)).lower())
@@ -74,6 +94,61 @@ def counting_notes(items: list, denominator) -> list[str]:
     return [f"展示清单 {len(items)} 条，计分对象 {int(d)} 项；分组、排除等对应关系见本项计数依据和核验范围。"]
 
 
+def evidence_has_content(entry: dict) -> bool:
+    return bool(entry.get("quote") or (
+        entry.get("kind") == "visual" and isinstance(entry.get("description"), str)
+        and len(entry["description"].strip()) >= 8
+        and str(entry.get("file", "")).lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".html", ".htm", ".pptx", ".docx", ".pdf", ".xlsx"))))
+
+
+def normalize_evidence_files(evidence: list, known_files: set[str]) -> list[dict]:
+    """Resolve only unambiguous spellings of already authorized files."""
+    normalized = []
+    for raw in evidence:
+        if not isinstance(raw, dict) or not isinstance(raw.get("file"), str):
+            raise ValueError("Evidence needs a file path")
+        entry = dict(raw)
+        value = entry["file"]
+        if value not in known_files and not is_source_url(value):
+            relative = value.replace("\\", "/")
+            if relative.startswith("/") or re.match(r"^[A-Za-z]:", relative) or ".." in relative.split("/"):
+                raise ValueError(f"Unknown evidence file: {value}")
+            relative = "/".join(part for part in relative.split("/") if part != ".")
+            candidates = {relative} if relative in known_files else set()
+            if not candidates and "/" not in relative:
+                candidates = {path for path in known_files if path.rsplit("/", 1)[-1] == relative
+                              or path.startswith("extracted/") and path.endswith(".txt")
+                              and path.rsplit("/", 1)[-1][:-4] == relative}
+            if len(candidates) != 1:
+                raise ValueError(f"Unknown or ambiguous evidence file: {value}")
+            entry["file"] = next(iter(candidates))
+            entry["file_as_returned"] = value
+        normalized.append(entry)
+    return normalized
+
+
+def validate_error_decisions(decisions, rules, known_files: set[str]) -> list[dict]:
+    expected = {rule.id for rule in rules}
+    if not isinstance(decisions, list) or any(not isinstance(entry, dict) for entry in decisions):
+        raise ValueError("Error decisions must be a list of records")
+    if {entry.get("id") for entry in decisions} != expected or len(decisions) != len(expected):
+        raise ValueError("Incomplete error decisions")
+    validated = []
+    for raw in decisions:
+        entry = dict(raw)
+        if not isinstance(entry.get("triggered"), bool) or not str(entry.get("reason", "")).strip():
+            raise ValueError(f"Invalid error decision {entry.get('id')}")
+        evidence = entry.get("evidence", [])
+        if not isinstance(evidence, list) or entry["triggered"] and not evidence:
+            raise ValueError("Triggered error needs locatable evidence")
+        entry["evidence"] = normalize_evidence_files(evidence, known_files)
+        if any(not item.get("locator") or not evidence_has_content(item) for item in entry["evidence"]):
+            raise ValueError("Critical-error evidence needs locator and quote or visual description")
+        validated.append(entry)
+    return validated
+
+
 def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
     record = dict(record)
     if record.get("id") != atom.id:
@@ -85,15 +160,13 @@ def validate_atom(record: dict, atom, known_files: set[str]) -> dict:
     evidence = record.get("evidence")
     if not isinstance(evidence, list) or not evidence:
         raise ValueError(f"{atom.id}: missing evidence list")
+    evidence = normalize_evidence_files(evidence, known_files)
     for entry in evidence:
         if not isinstance(entry, dict) or not entry.get("file") or not entry.get("locator"):
             raise ValueError(f"{atom.id}: evidence needs file, locator, quote or explicit visual description")
-        visual = (entry.get("kind") == "visual" and isinstance(entry.get("description"), str)
-                  and len(entry["description"].strip()) >= 8
-                  and str(entry["file"]).lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".html", ".htm", ".pptx", ".docx", ".pdf", ".xlsx")))
-        if not entry.get("quote") and not visual:
+        if not evidence_has_content(entry):
             raise ValueError(f"{atom.id}: evidence needs a text quote or a located visual description")
-        if entry["file"] not in known_files and not str(entry["file"]).startswith("https://"):
+        if entry["file"] not in known_files and not is_source_url(entry["file"]):
             raise ValueError(f"{atom.id}: unknown evidence file {entry['file']}")
     if atom.kind == "BIN":
         state = number(record.get("state"))

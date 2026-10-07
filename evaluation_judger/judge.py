@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import shutil
 import hashlib
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +16,7 @@ from .isolation import restrict_reads, enable_image_reads
 from .multisample import review_multi_atom
 from .opencode import JudgeError, TaskSession, extract_json, parse_events, probe, run
 from .rubric import shared_sample_references
-from .scoring import calculate, shared_items_match, validate_atom, result_is_consistent
+from .scoring import calculate, shared_items_match, validate_atom, result_is_consistent, validate_error_decisions
 
 
 def write_json(path: Path, value: object) -> None:
@@ -95,6 +96,18 @@ def workspace_for(task: Task, subject: str, config: dict, project: Path, run_dir
     agent_dir = workspace / ".opencode" / "agents"
     agent_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(project / ".opencode" / "agents" / "judge.md", agent_dir / "judge.md")
+    if "temperature" in config:
+        # The per-workspace Markdown agent has precedence over JSON settings.
+        # Keep the shared default untouched and bind explicit overrides in the fingerprint.
+        agent_path = agent_dir / "judge.md"
+        agent_text = agent_path.read_text(encoding="utf-8")
+        frontmatter, separator, body = agent_text[4:].partition("\n---")
+        if not agent_text.startswith("---\n") or not separator:
+            raise ValueError("Judge agent requires YAML frontmatter")
+        frontmatter = re.sub(r"(?m)^temperature:.*$", "temperature: " + str(config["temperature"]), frontmatter)
+        if not re.search(r"(?m)^temperature:", frontmatter):
+            frontmatter += "\ntemperature: " + str(config["temperature"])
+        agent_path.write_text("---\n" + frontmatter + separator + body, encoding="utf-8")
     items = [("question", task.question), ("rubric", task.rubric.path)]
     items += [("sources", p) for p in task.sources]
     items += [("deliveries", p) for p in task.deliveries[subject]]
@@ -143,9 +156,9 @@ Rubric time context: {json.dumps(time_notes, ensure_ascii=False)}. The process e
 
 Assigned rubric atoms (verbatim rule text):\n{json.dumps(rules, ensure_ascii=False, indent=2)}
 
-Return one decision for EVERY assigned atom, in this order. Use the exact rubric conditions. For BIN state is 0 or 1. For RATIO/CLAIM-RATIO/COUNT give numerator, denominator, state= numerator/denominator, and an `items` array that identifies each counted element, its result and supporting location. If the rule specifies an empty-set state, use it with numerator=denominator=0. If the denominator is an exhaustive set, inspect the entire relevant delivery; do not silently sample. For a capped count formula min(n/target,1) or min(n,target)/target, report the actual observed count as numerator, target as denominator, and saturated state; these are distinct from success/total ratios. For thousands of workbook rows, use exact material_inspector calculations with explicit worksheets/ranges, criteria and aggregate counts instead of emitting a redundant item per raw row. Retain itemized criteria and every concrete failed finding, and explain how aggregates yield the operands. For external sources, use webfetch only when needed and supply full HTTPS URL. Historical reuse of a submission is not itself a defect; judge time-sensitive claims as of its execution/cutoff date, while following the rubric's substantive requirements. If available, use material_inspector for exact workbook statistics/correlations, cells/formulas, chart definitions and paginated OOXML inspection. It only reads this workspace's authorized materials. Never guess row counts or arithmetic from a small sample. Inspect relevant structures for chart, workbook and formatting atoms; text extraction alone cannot prove visual layout. Read long extracted files in segments through the end of the relevant scope. For required PPT rendering, use material_inspector pptx_visual; for required website layout/interactivity use browser with rubric-required viewport widths and finite controls. Cite the original file with slide/shape or viewport/selector and actual measured findings. Interpret overflow/overlap candidates in context rather than treating candidates as automatic defects. Controlled local browser JavaScript is permitted for preview; never execute delivered shell/Python/native code, perform attacks, credential checks or contact IP addresses in simulated incident logs.
+Return one decision for EVERY assigned atom, in this order. Use the exact rubric conditions. For BIN state is 0 or 1. For RATIO/CLAIM-RATIO/COUNT give numerator, denominator, state= numerator/denominator, and an `items` array that identifies each counted element, its result and supporting location. Prefer claim as the text field identifying each audited statement; supported semantic field aliases remain accepted. If the rule specifies an empty-set state, use it with numerator=denominator=0. If the denominator is an exhaustive set, inspect the entire relevant delivery; do not silently sample. For a capped count formula min(n/target,1) or min(n,target)/target, report the actual observed count as numerator, target as denominator, and saturated state; these are distinct from success/total ratios. For thousands of workbook rows, use exact material_inspector calculations with explicit worksheets/ranges, criteria and aggregate counts instead of emitting a redundant item per raw row. Retain itemized criteria and every concrete failed finding, and explain how aggregates yield the operands. For external sources, use webfetch only when needed and supply full HTTP or HTTPS URL. Historical reuse of a submission is not itself a defect; judge time-sensitive claims as of its execution/cutoff date, while following the rubric's substantive requirements. If available, use material_inspector for exact workbook statistics/correlations, cells/formulas, chart definitions and paginated OOXML inspection. It only reads this workspace's authorized materials. Never guess row counts or arithmetic from a small sample. Inspect relevant structures for chart, workbook and formatting atoms; text extraction alone cannot prove visual layout. Read long extracted files in segments through the end of the relevant scope. For required PPT rendering, use material_inspector pptx_visual; for required website layout/interactivity use browser with rubric-required viewport widths and finite controls. Cite the original file with slide/shape or viewport/selector and actual measured findings. Interpret overflow/overlap candidates in context rather than treating candidates as automatic defects. Controlled local browser JavaScript is permitted for preview; never execute delivered shell/Python/native code, perform attacks, credential checks or contact IP addresses in simulated incident logs.
 
-Each decision must have id, state, observation (what the delivery actually says or lacks), reason (specific explanation linking observation to rule), evidence array of {{file,locator,quote}}, and ratio fields where applicable. Evidence `file` must be one of the listed original or extracted paths, or a full HTTPS URL. For a missing item, identify which delivery files and sections you checked; use the inspected delivery as evidence. Quotes should be short and literal where text exists; do not join distant passages with ellipses in one quote. Avoid generic reasons such as 'insufficient' without a concrete explanation. Explain uncertain evidence and still reach a supported score; do not invent a negative finding from lack of access.
+Each decision must have id, state, observation (what the delivery actually says or lacks), reason (specific explanation linking observation to rule), evidence array of {{file,locator,quote}}, and ratio fields where applicable. Evidence `file` must be one of the listed original or extracted paths, or a full HTTP or HTTPS URL. For a missing item, identify which delivery files and sections you checked; use the inspected delivery as evidence. Quotes should be short and literal where text exists; do not join distant passages with ellipses in one quote. Avoid generic reasons such as 'insufficient' without a concrete explanation. Explain uncertain evidence and still reach a supported score; do not invent a negative finding from lack of access.
 
 Write observations, reasons and item explanations in clear Chinese. Each item explanation must address that exact item's subject, predicate, date and scope; support for another statement in the same paragraph does not establish support for this statement. A related reference title alone does not establish its unseen contents. State what was actually inspected and any access limitations, then apply the rubric without inventing a negative finding. Preserve literal evidence quotes in their original language. Return JSON only between BEGIN_JUDGMENT and END_JUDGMENT, shape: {{"atoms":[...]}}. Do not omit any atom.
 {('Previous attempt failed validation: ' + previous_error) if previous_error else ''}
@@ -155,7 +168,52 @@ Write observations, reasons and item explanations in clear Chinese. Each item ex
 def _error_prompt(task: Task, subject: str, manifest: dict, records: list[dict]) -> str:
     rules = [dict(id=e.id, trigger=e.trigger, effects=e.effects) for e in task.rubric.errors]
     states = {r["id"]: {"state": r["state"], "reason": r["reason"]} for r in records}
-    return f"""Evaluate whether any critical error cap is triggered for task {task.id}, participant {subject}. Read the delivery and relevant extracted source files with the read tool. The files are listed in manifest.json. Apply each trigger only when specific evidence supports it; lack of access to an external site is not proof of fabrication. Completed atom decisions: {json.dumps(states, ensure_ascii=False, indent=2)}. Reuse the locked atom states for any trigger referring to an atom ratio; do not recalculate it differently. Return every error code with triggered true/false, concrete reason, and evidence array of {{file,locator,quote}} when triggered. Full HTTPS URLs are allowed for external evidence. Rules: {json.dumps(rules, ensure_ascii=False, indent=2)}. Return BEGIN_JUDGMENT then JSON object {{"errors":[...]}} then END_JUDGMENT."""
+    return f"""Evaluate whether any critical error cap is triggered for task {task.id}, participant {subject}. Read the delivery and relevant extracted source files with the read tool. The files are listed in manifest.json. Apply each trigger only when specific evidence supports it; lack of access to an external site is not proof of fabrication. Completed atom decisions: {json.dumps(states, ensure_ascii=False, indent=2)}. Reuse the locked atom states for any trigger referring to an atom ratio; do not recalculate it differently. Return every error code with triggered true/false, concrete reason, and evidence array of {{file,locator,quote}} when triggered. For visible visual findings with no literal text, use kind=visual and a specific description (at least 8 characters), citing the listed original file and a visual locator; do not invent a quote. Full HTTPS URLs are allowed for external evidence. Rules: {json.dumps(rules, ensure_ascii=False, indent=2)}. Return BEGIN_JUDGMENT then JSON object {{"errors":[...]}} then END_JUDGMENT."""
+
+
+def _error_decisions(task, subject, manifest, records, known_files, workspace, session):
+    """Recover a bounded error phase without discarding locked atom batches."""
+    checkpoint = workspace / "checkpoints/errors.json"
+    digest = _digest(records)
+    failure = ""
+    if checkpoint.exists():
+        try:
+            cached = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if cached.get("input_hash") == digest:
+                return validate_error_decisions(cached["errors"], task.rubric.errors, known_files)
+        except (ValueError, KeyError, TypeError) as exc:
+            failure = str(exc)
+    if not task.rubric.errors:
+        return []
+    history = sorted((workspace / "events").glob(f"errors-{digest[:12]}-*.jsonl"),
+                     key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in history:
+        try:
+            answer = parse_events(path.read_text(encoding="utf-8"))[0]
+            if "END_JUDGMENT" not in answer:
+                continue
+            decisions = validate_error_decisions(extract_json(answer)["errors"], task.rubric.errors, known_files)
+            write_json(checkpoint, {"input_hash": digest, "errors": decisions})
+            return decisions
+        except (ValueError, KeyError, TypeError, JudgeError) as exc:
+            failure = str(exc)
+    for attempt in range(2):
+        index = len(history) + attempt
+        event = workspace / f"events/errors-{digest[:12]}-{index}.jsonl"
+        while event.exists():
+            index += 1
+            event = workspace / f"events/errors-{digest[:12]}-{index}.jsonl"
+        correction = ("\nCorrect this validation issue without changing the locked atom judgments: " + failure
+                      + "\nUse exact authorized evidence paths: " + json.dumps(sorted(known_files), ensure_ascii=False)) if failure else ""
+        answer, _ = session.ask(_error_prompt(task, subject, manifest, records) + correction,
+                                f"judge {task.id} {subject} critical errors", event)
+        try:
+            decisions = validate_error_decisions(extract_json(answer)["errors"], task.rubric.errors, known_files)
+            write_json(checkpoint, {"input_hash": digest, "errors": decisions})
+            return decisions
+        except (ValueError, KeyError, TypeError, JudgeError) as exc:
+            failure = str(exc)
+    raise JudgeError(f"{task.id}/{subject}: error decisions did not validate after bounded correction: {failure}")
 
 
 def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: Path) -> dict:
@@ -335,16 +393,23 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
                     return reviewed
                 except (JudgeError, ValueError, KeyError, TypeError):
                     continue
+            old_indices = [int(p.stem.rsplit("-", 1)[1]) for p in (workspace / "events").glob(f"shared-review-{label}-attempt-*.jsonl")
+                           if p.stem.rsplit("-", 1)[1].isdigit()]
+            next_event = max(old_indices, default=-1) + 1
+            failure = ""
             for attempt in range(2):
                 prompt = f"""Review ONLY atom {current_atom.id} for task {task.id}, subject {subject}. Read relevant delivery, rubric and sources with the read tool. Existing decision: {json.dumps(current_record, ensure_ascii=False, indent=2)}. {instruction} Cite delivery files, original sources or external URLs as factual evidence. Do not cite this project's checkpoints, events or earlier scores as factual evidence. Return a complete atom record with numeric state, observation, concrete reason, evidence with file/locator/quote, numerator, denominator and every itemized check. Return BEGIN_JUDGMENT then JSON {{"atom":{{...}}}} then END_JUDGMENT."""
-                answer, _ = run(workspace, prompt, f"review shared sample {task.id} {subject} {current_atom.id}", workspace / "events" / f"shared-review-{label}-attempt-{attempt}.jsonl", project, model, major=major)
+                if failure:
+                    prompt += "\nCorrect this validation issue without changing the locked sample: " + failure
+                answer, _ = run(workspace, prompt, f"review shared sample {task.id} {subject} {current_atom.id}", workspace / "events" / f"shared-review-{label}-attempt-{next_event + attempt}.jsonl", project, model, major=major)
                 try:
                     reviewed = check(extract_json(answer)["atom"])
                     write_json(path, {"input_hash": key, "atom": reviewed})
                     return reviewed
-                except (ValueError, KeyError, TypeError, JudgeError):
+                except (ValueError, KeyError, TypeError, JudgeError) as exc:
+                    failure = str(exc)
                     if attempt == 1:
-                        raise JudgeError(f"{task.id}/{subject}: shared sample {label} remains inconsistent")
+                        raise JudgeError(f"{task.id}/{subject}: shared sample {label} remains inconsistent: {failure}")
             raise AssertionError("unreachable")
 
         source = records[source_pos]
@@ -367,28 +432,7 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
                                               task_id=task.id, subject=subject, workspace=workspace,
                                               fingerprint=manifest["fingerprint"], known_files=known_files,
                                               project=project, model=model, major=major)
-    error_checkpoint = workspace / "checkpoints" / "errors.json"
-    error_hash = _digest(records)
-    cached_errors = json.loads(error_checkpoint.read_text(encoding="utf-8")) if error_checkpoint.exists() else {}
-    if cached_errors.get("input_hash") == error_hash:
-        decisions = cached_errors["errors"]
-    elif task.rubric.errors:
-        answer, _ = session.ask(_error_prompt(task, subject, manifest, records), f"judge {task.id} {subject} critical errors", workspace / "events" / "errors.jsonl")
-        decisions = extract_json(answer)["errors"]
-        expected = {e.id for e in task.rubric.errors}
-        if {e.get("id") for e in decisions} != expected or len(decisions) != len(expected):
-            raise JudgeError(f"{task.id}/{subject}: incomplete error decisions")
-        for entry in decisions:
-            if not isinstance(entry.get("triggered"), bool) or not str(entry.get("reason", "")).strip():
-                raise JudgeError(f"{task.id}/{subject}: invalid error decision {entry.get('id')}")
-            if entry["triggered"] and not entry.get("evidence"):
-                raise JudgeError(f"{task.id}/{subject}: triggered error needs evidence")
-            for ev in entry.get("evidence", []):
-                if ev.get("file") not in known_files and not str(ev.get("file", "")).startswith("https://"):
-                    raise JudgeError(f"{task.id}/{subject}: unknown critical-error evidence file {ev.get('file')}")
-        write_json(error_checkpoint, {"input_hash": error_hash, "errors": decisions})
-    else:
-        decisions = []
+    decisions = _error_decisions(task, subject, manifest, records, known_files, workspace, session)
     critical_review = None
     if config.get("critical_error_review", False):
         from .critical_review import review_critical

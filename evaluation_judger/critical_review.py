@@ -6,7 +6,7 @@ import json
 import re
 
 from .opencode import JudgeError, extract_json, run, parse_events, event_session
-from .scoring import number, shared_items_match, validate_atom
+from .scoring import number, shared_items_match, validate_atom, normalize_evidence_files, evidence_has_content, is_source_url
 
 
 def review_context(task, records, decisions):
@@ -53,6 +53,7 @@ def check_review(task, records, decisions, payload, known_files):
     errors = payload.get("errors")
     if not isinstance(errors, list) or {entry.get("id") for entry in errors} != set(rules) or len(errors) != len(rules):
         raise ValueError("Critical review must return every error decision")
+    errors = [dict(entry) for entry in errors]
     for entry in errors:
         if not isinstance(entry.get("triggered"), bool) or len(str(entry.get("reason", "")).strip()) < (20 if original_errors[entry.get("id", "")]["triggered"] else 1):
             raise ValueError("Critical review requires explicit decisions and concrete reasons")
@@ -60,10 +61,11 @@ def check_review(task, records, decisions, payload, known_files):
             raise ValueError("Critical review cannot introduce a new severe error")
         if entry["triggered"] and not entry.get("evidence"):
             raise ValueError("A confirmed severe error requires locatable evidence")
+        entry["evidence"] = normalize_evidence_files(entry.get("evidence", []), known_files)
         for evidence in entry.get("evidence", []):
-            if not all(evidence.get(key) for key in ("file", "locator", "quote")):
-                raise ValueError("Critical review evidence requires file, locator and quote")
-            if evidence["file"] not in known_files and not str(evidence["file"]).startswith("https://"):
+            if not all(evidence.get(key) for key in ("file", "locator")) or not evidence_has_content(evidence):
+                raise ValueError("Critical review evidence requires file, locator and quote or visual description")
+            if evidence["file"] not in known_files and not is_source_url(evidence["file"]):
                 raise ValueError("Critical review evidence leaves authorized materials")
     return [indexed[record["id"]] for record in records], errors
 
@@ -105,7 +107,8 @@ def review_critical(task, records, decisions, *, known_files, workspace, project
                 old.rename(archive)
     write_json(input_path, payload)
     prompt = """Independently audit the precise evidential/logical validity of the TRIGGERED severe errors in critical-review-input.json for THIS task and participant. Read that formatted file and the relevant original/extracted materials listed in manifest.json; use webfetch only as needed. Do not read any other participant. Treat the earlier decisions as hypotheses, not factual sources. A refutation must match the exact subject, predicate, event and cutoff: an earlier partnership does not prove no later suspension; 'not used for training' does not refute another data-use allegation; a later price/valuation does not disprove an earlier value; absence from one newsroom/index or an inaccessible link alone does not establish fabrication. Historical reuse itself is not an error. Unknown evidence must not be converted into proven falsehood or severe fabrication. Apply the rubric's actual truth/empty-set/sampling requirements and reach supported decisions automatically.
-Return every error code in errors [{id,triggered,reason,evidence:[{file,locator,quote}]}], preserving originally untriggered codes as false. Confirm a severe error only with specific evidence actually implying its trigger; otherwise revoke it and explain the exact logical insufficiency. If a negative atom in a metric affected by these ceilings depends on the SAME logically invalid counterevidence, include its complete corrected record in atom_corrections, with id,state,observation,reason,evidence and ratio fields/items where applicable. Keep the locked factual claim sample, ordering and denominator for CLAIM-RATIO; explain each changed item's evidence. Change only these unsupported negative findings, retain unrelated findings, and never add a new penalty. Do not infer satisfaction solely from uncertainty: follow the exact rubric and explain the best supported decision. Keep corrections empty when no atom decision needs correction. Evidence must cite original/extracted materials or actual HTTPS sources; not review inputs/checkpoints as factual sources. Write explanations in Chinese. Return BEGIN_JUDGMENT then JSON {"errors":[...],"atom_corrections":[...]} then END_JUDGMENT."""
+Return every error code in errors [{id,triggered,reason,evidence:[{file,locator,quote}]}], preserving originally untriggered codes as false. Confirm a severe error only with specific evidence actually implying its trigger; otherwise revoke it and explain the exact logical insufficiency. If a negative atom in a metric affected by these ceilings depends on the SAME logically invalid counterevidence, include its complete corrected record in atom_corrections, with id,state,observation,reason,evidence and ratio fields/items where applicable. Keep the locked factual claim sample, ordering and denominator for CLAIM-RATIO; explain each changed item's evidence. Change only these unsupported negative findings, retain unrelated findings, and never add a new penalty. Do not infer satisfaction solely from uncertainty: follow the exact rubric and explain the best supported decision. Keep corrections empty when no atom decision needs correction. Evidence must cite original/extracted materials or actual HTTP or HTTPS sources; not review inputs/checkpoints as factual sources. Write explanations in Chinese. Return BEGIN_JUDGMENT then JSON {"errors":[...],"atom_corrections":[...]} then END_JUDGMENT."""
+    prompt += '\nFor visible visual findings without literal text, evidence may use kind=visual and a specific description (at least 8 characters), with the listed original file and a visual locator. Do not invent a textual quote.'
     if scoped_input:
         prompt += '\nThe input retains all eligible negative atoms, their linked claim samples, and atoms explicitly named by the triggered clauses/decisions. Other previous judgments remain in critical-review-full-input.json if genuinely needed as context. They are hypotheses, never factual sources. Do not redo unrelated scoring. Return all error decisions and inspect the relevant primary evidence independently.'
     failure = ""

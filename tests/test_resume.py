@@ -12,6 +12,51 @@ from evaluation_judger.scoring import calculate
 
 
 class RegroupedCheckpoints(TestCase):
+    def test_fresh_judgment_with_no_atom_checkpoints(self):
+        atoms = [SimpleNamespace(id=f'X{i}', metric=metric, weight=Decimal(100), kind='BIN', rule='核验交付', purpose='核验', evidence='可定位正文') for i, metric in enumerate(METRICS)]
+        task = SimpleNamespace(id='demo', name='全新评分', dimension='维度', rubric=SimpleNamespace(atoms=atoms, errors=[], text='固定标准', by_metric=lambda m: [a for a in atoms if a.metric == m]))
+        records = [{'id': a.id, 'state': 1, 'observation': '交付包含明确的完整内容。', 'reason': '交付具体内容与评分要求一致，并有以下逐字证据支持判定。', 'evidence': [{'file': 'delivery.md', 'locator': 'L1', 'quote': '具体证据'}]} for a in atoms]
+        with TemporaryDirectory() as folder:
+            root = Path(folder); (root / 'probe-ok.json').write_text('{}')
+            manifest = {'fingerprint': 'fixed', 'process_record': {}, 'files': [{'file': 'delivery.md', 'extracted': 'delivery.md'}]}
+            def answer(prompt, title, output):
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_text(json.dumps({'type': 'text', 'part': {'text': 'BEGIN_JUDGMENT '+json.dumps({'atoms': records})+' END_JUDGMENT'}}), encoding='utf-8')
+                return '', True
+            manifest['files'][0]['limitation'] = None
+            with patch('evaluation_judger.judge.workspace_for', return_value=(root, manifest)), patch('evaluation_judger.judge.TaskSession.ask', side_effect=answer) as model:
+                result = judge_task(task, 'subject', {'batch_size': 6}, root, root)
+            self.assertEqual(model.call_count, 1)
+            self.assertEqual(len(result['atoms']), 6)
+            self.assertEqual(result['scores']['quality_mean'], '5')
+
+    def test_shared_sample_repair_reports_error_and_preserves_old_events(self):
+        atoms = [SimpleNamespace(id=f'X{i}', metric=metric, weight=Decimal(100), kind='BIN', rule='核验交付', purpose='核验') for i, metric in enumerate(METRICS)]
+        source = next(a for a in atoms if a.metric == 'accuracy'); source.id='A01'; source.kind='CLAIM-RATIO'
+        target = next(a for a in atoms if a.metric == 'hallucination'); target.id='H01'; target.kind='CLAIM-RATIO'; target.rule='主张切分与核验全集同A01'
+        task = SimpleNamespace(id='demo', name='样本恢复', dimension='维度', rubric=SimpleNamespace(atoms=atoms, errors=[], by_metric=lambda m: [a for a in atoms if a.metric == m]))
+        base = {'state': 1, 'observation': '交付内容有明确支撑且已逐项检查。', 'reason': '已核对当前主张及对应来源，证据明确满足当前评分要求。', 'evidence': [{'file': 'delivery.md', 'locator': 'L1', 'quote': '具体证据'}]}
+        records = [{**base, 'id': a.id} for a in atoms]
+        items = [{'claim': '主张一', 'result': 'supported'}, {'claim': '主张二', 'result': 'supported'}]
+        next(r for r in records if r['id']=='A01').update(numerator=2, denominator=2, items=items)
+        initial = next(r for r in records if r['id']=='H01'); initial.update(numerator=1, denominator=1, items=items[:1])
+        valid = {**initial, 'numerator': 2, 'denominator': 2, 'items': items}
+        with TemporaryDirectory() as folder:
+            root=Path(folder); (root/'events').mkdir(); (root/'probe-ok.json').write_text('{}')
+            for i, record in enumerate(records):
+                (root/f'events/atoms-{i:03d}-attempt-0.jsonl').write_text(json.dumps({'type':'text','part':{'text':'BEGIN_JUDGMENT '+json.dumps(record)+' END_JUDGMENT'}}),encoding='utf-8')
+            old=root/'events/shared-review-H01-attempt-0.jsonl'
+            old.write_text(json.dumps({'type':'text','part':{'text':'BEGIN_JUDGMENT '+json.dumps({'atom':initial})+' END_JUDGMENT'}}),encoding='utf-8')
+            original=old.read_bytes()
+            manifest={'fingerprint':'fixed','process_record':{},'files':[{'file':'delivery.md','extracted':'delivery.md'}]}
+            with patch('evaluation_judger.judge.workspace_for',return_value=(root,manifest)), patch('evaluation_judger.judge.run',side_effect=[(json.dumps({'atom':initial}),True),(json.dumps({'atom':valid}),True)]) as model:
+                result=judge_task(task,'subject',{'batch_size':1},root,root)
+            self.assertEqual(model.call_count,2)
+            self.assertIn('Expected exactly 2',model.call_args_list[1].args[1])
+            self.assertEqual([call.args[3].name for call in model.call_args_list],['shared-review-H01-attempt-1.jsonl','shared-review-H01-attempt-2.jsonl'])
+            self.assertEqual(old.read_bytes(),original)
+            self.assertEqual(next(r for r in result['atoms'] if r['id']=='H01')['denominator'],2)
+
     def test_direct_atom_logs_resume_without_model_calls(self):
         atoms = [SimpleNamespace(id=f'X{i}', metric=metric, weight=Decimal(100), kind='BIN', rule='检查具体交付', purpose='核验') for i, metric in enumerate(METRICS)]
         task = SimpleNamespace(id='demo', name='日志恢复', dimension='维度', rubric=SimpleNamespace(atoms=atoms, errors=[], by_metric=lambda m: [a for a in atoms if a.metric == m]))

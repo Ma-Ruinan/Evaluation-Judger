@@ -9,7 +9,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .opencode import JudgeError, extract_json, run
-from .scoring import validate_atom
+from .scoring import validate_atom, claim_label
 
 
 def _save(path: Path, value: dict) -> None:
@@ -26,7 +26,7 @@ def _hash(value) -> str:
 def _label(item) -> str:
     if not isinstance(item, dict):
         return str(item)
-    return str(item.get("claim") or item.get("element") or item.get("statement") or item.get("name") or item.get("id") or "")
+    return claim_label(item) or str(item.get("id") or "")
 
 
 def _pool(source_records: dict) -> list[dict]:
