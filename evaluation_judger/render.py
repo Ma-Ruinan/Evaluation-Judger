@@ -193,6 +193,13 @@ def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
         lines.append("")
     for result in results:
         lines += ["", f"## {_safe(names[result['subject']])} 逐项依据", "", f"完整逐项核验清单：`{result['subject']}.json`。下文对较长清单展示全部未通过项及少量通过项示例。", ""]
+        review = result.get("evidence_contract_review", {})
+        if review:
+            lines += ["### 缺陷归属与证据复核", "", f"复核状态：{_safe(review.get('status', '未记录'))}；完整检查范围及修正记录见该对象 JSON 的 evidence_contract_review。", ""]
+            for defect in review.get("review", {}).get("defects", []):
+                owners = "；".join(f"{LABELS.get(o['metric'], o['metric'])}由{o['atom_id']}主责：{o['consequence']}" for o in defect['owners'])
+                lines += [f"- {_safe(defect['id'])}：{_safe(defect['description'])}。{_safe(owners)}。{_safe(defect.get('disposition',''))}"]
+            lines.append("")
         for metric in METRICS:
             lines += [f"### {LABELS[metric]}", ""]
             for atom in [a for a in result["atoms"] if a["metric"] == metric]:

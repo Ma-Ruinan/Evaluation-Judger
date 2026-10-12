@@ -23,6 +23,8 @@ from .scoring import calculate, shared_items_match, result_is_consistent as _res
 
 def _context(config_path: Path):
     config = load_config(config_path)
+    if config.get("relation_review", False) and not config.get("evidence_contract_review", False):
+        raise ValueError("relation_review requires evidence_contract_review")
     project = Path(__file__).resolve().parent.parent
     run_dir = Path(config.get("run_dir", project / "runs" / config_path.stem)).resolve()
     tasks = discover(config)
@@ -48,7 +50,12 @@ def _results(config, run_dir, tasks):
                 needs_critical_review = (config.get("critical_error_review", False) and isinstance(loaded, dict)
                     and any(entry.get("triggered") for entry in loaded.get("errors", []))
                     and loaded.get("critical_error_review_version") != 1)
-                if isinstance(loaded, dict) and not needs_critical_review and loaded.get("fingerprint") == task_fingerprint(task, subject["id"], config) and _result_is_consistent(task, loaded):
+                needs_contract_review = (config.get("evidence_contract_review", False)
+                    and isinstance(loaded, dict) and loaded.get("evidence_contract_review", {}).get("status") != "passed")
+                needs_relation_review = (config.get("relation_review", False) and isinstance(loaded, dict)
+                    and (loaded.get("relation_inventory", {}).get("status") != "passed"
+                         or loaded.get("relation_inventory", {}).get("version") != 1))
+                if isinstance(loaded, dict) and not needs_critical_review and not needs_contract_review and not needs_relation_review and loaded.get("fingerprint") == task_fingerprint(task, subject["id"], config) and _result_is_consistent(task, loaded):
                     result_map[(task.id, subject["id"])] = loaded
                 else:
                     missing.append((task.id, subject["id"]))
@@ -72,7 +79,12 @@ def _run_task(task, config, project, run_dir):
         started = time.perf_counter()
         outcome = 'incomplete'
         try:
-            judge_task(task, subject["id"], config, project, run_dir)
+            result = judge_task(task, subject["id"], config, project, run_dir)
+            if (config.get("evidence_contract_review", False)
+                    and result.get("evidence_contract_review", {}).get("status") != "passed"):
+                raise ValueError("Evidence contract review incomplete; valid atom records retained for resume")
+            if config.get("relation_review", False) and result.get("relation_inventory", {}).get("status") != "passed":
+                raise ValueError("Relation inventory incomplete; checkpoints retained for resume")
             outcome = 'completed'
         except Exception as exc:
             # Retain all prior checkpoints and continue independent subjects/tasks.

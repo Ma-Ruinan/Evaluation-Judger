@@ -33,7 +33,7 @@ class TemperatureTests(unittest.TestCase):
         self.assertFalse(shared_items_match(source, source + source))
         self.assertFalse(shared_items_match(source, [{'location': 'same page'}]))
         self.assertFalse(shared_items_match(source, [{'id': source[0]['subject']}]))
-        for alias in ('claim', 'element', 'statement', 'subject', 'item', 'name'):
+        for alias in ('claim', 'element', 'statement', 'subject', 'item', 'name', 'claim_group', 'checkpoint'):
             with self.subTest(alias=alias):
                 alternative = {alias: source[0]['subject']}
                 self.assertTrue(shared_items_match(source, [alternative]))

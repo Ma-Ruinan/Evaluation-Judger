@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .dataset import Task, process_records, task_fingerprint, logical_delivery_name
-from .materials import extract
+from .materials import extract, structured_evidence
 from .inspection import install_tool
 from .isolation import restrict_reads, enable_image_reads
 from .multisample import review_multi_atom
@@ -112,6 +112,7 @@ def workspace_for(task: Task, subject: str, config: dict, project: Path, run_dir
     items += [("sources", p) for p in task.sources]
     items += [("deliveries", p) for p in task.deliveries[subject]]
     manifest = {"task": task.id, "subject": subject, "fingerprint": digest, "files": []}
+    material_index = {"version": 1, "note": "Inventory only; URLs and field names do not prove source truth or nonempty values.", "files": []}
     subject_prefix = next((s["prefix"] for s in config.get("subjects", []) if s["id"] == subject), "")
     for category, path in items:
         relative = Path(category) / path.relative_to(task.directory)
@@ -124,8 +125,12 @@ def workspace_for(task: Task, subject: str, config: dict, project: Path, run_dir
         extracted.parent.mkdir(parents=True, exist_ok=True)
         extracted.write_text(text, encoding="utf-8")
         manifest["files"].append({"category": category, "file": relative.as_posix(), "extracted": extracted.relative_to(workspace).as_posix(), "limitation": limitation, "modified_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")})
+        if path.suffix.lower() in {".html", ".htm", ".pdf"}:
+            material_index["files"].append({"file": relative.as_posix(), **structured_evidence(path)})
         if category == "deliveries" and config.get("collection_prefixes_are_metadata", False):
             manifest["files"][-1]["logical_name"] = logical_delivery_name(path.name, task.id, subject_prefix, config)
+    write_json(workspace / "material-index.json", material_index)
+    manifest["files"].append({"category": "material_index", "file": "material-index.json", "extracted": "material-index.json", "limitation": None})
     process = process_records(config)[task.id][subject]
     process_path = workspace / "process-record.json"
     write_json(process_path, process)
@@ -150,6 +155,7 @@ def _prompt(task: Task, subject: str, atoms, manifest: dict, previous_error: str
 {naming_note}
 
 Files:\n{chr(10).join(files)}
+Read material-index.json for original hyperlinks, PDF URI annotations and JSON reference metadata. Its contents are inventories, not verification outcomes. Apply the rubric's primary-report/attachment policy; equivalent formats may provide complementary evidence when allowed. A clickable link counts as a locator unless the rule explicitly requires visible URL text. A field with an empty value is not a disclosed date/version. Before declaring a source/element absent, inspect relevant files and indexed structures and state the scope checked. Do not confuse extraction limitations with submission defects.
 {image_note}
 Process record: {json.dumps(manifest['process_record'], ensure_ascii=False, default=str)}
 Rubric time context: {json.dumps(time_notes, ensure_ascii=False)}. The process execution timestamp is {manifest['process_record'].get('executed_at') or 'not recorded'}. A rubric preparation date is not automatically a participant execution date. If a delivered report states a cutoff matching its preserved file modification date and no stronger execution timestamp contradicts it, treat that as supportive context. Record the inference and its limitation. Do not deduct solely because a reused delivery is later than the rubric preparation baseline.
@@ -161,6 +167,7 @@ Return one decision for EVERY assigned atom, in this order. Use the exact rubric
 Each decision must have id, state, observation (what the delivery actually says or lacks), reason (specific explanation linking observation to rule), evidence array of {{file,locator,quote}}, and ratio fields where applicable. Evidence `file` must be one of the listed original or extracted paths, or a full HTTP or HTTPS URL. For a missing item, identify which delivery files and sections you checked; use the inspected delivery as evidence. Quotes should be short and literal where text exists; do not join distant passages with ellipses in one quote. Avoid generic reasons such as 'insufficient' without a concrete explanation. Explain uncertain evidence and still reach a supported score; do not invent a negative finding from lack of access.
 
 Write observations, reasons and item explanations in clear Chinese. Each item explanation must address that exact item's subject, predicate, date and scope; support for another statement in the same paragraph does not establish support for this statement. A related reference title alone does not establish its unseen contents. State what was actually inspected and any access limitations, then apply the rubric without inventing a negative finding. Preserve literal evidence quotes in their original language. Return JSON only between BEGIN_JUDGMENT and END_JUDGMENT, shape: {{"atoms":[...]}}. Do not omit any atom.
+For exhaustive item checks, provide one outcome per counted item. Grouping is allowed only with explicit member IDs or a reproducible range/count, and supported per-member checks or an exact inspector calculation. A uniform template or a few populated examples never proves all remaining fields are nonempty. Do not omit relation/direction contradictions when repeated numeric values happen to match.
 {('Previous attempt failed validation: ' + previous_error) if previous_error else ''}
 """
 
@@ -216,7 +223,44 @@ def _error_decisions(task, subject, manifest, records, known_files, workspace, s
     raise JudgeError(f"{task.id}/{subject}: error decisions did not validate after bounded correction: {failure}")
 
 
+def _review_progress(task, records, *, workspace, fingerprint, known_files, save=False):
+    """Resume from a complete validated review state, never an unfinished score."""
+    path = workspace / "checkpoints/review-progress.json"
+    if save:
+        candidate = records
+    else:
+        if not path.exists():
+            return records
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if (saved.get("version") != 1 or saved.get("fingerprint") != fingerprint
+                    or saved.get("atoms_hash") != _digest(saved.get("atoms"))):
+                return records
+            candidate = saved["atoms"]
+        except (OSError, ValueError, TypeError, KeyError):
+            return records
+    try:
+        atoms = {atom.id: atom for atom in task.rubric.atoms}
+        for record in candidate:
+            validate_atom(record, atoms[record["id"]], known_files)
+        complete = {"atoms": candidate, "errors": [], "scores": calculate(task.rubric, candidate, [])}
+        if not result_is_consistent(task, complete):
+            raise ValueError("Incomplete or inconsistent reviewed atom set")
+    except (ValueError, TypeError, KeyError):
+        if save:
+            raise JudgeError("Cannot checkpoint an invalid review state")
+        return records
+    if save:
+        payload = {"version": 1, "fingerprint": fingerprint, "atoms_hash": _digest(candidate),
+                   "stage": "needs_contract_review", "atoms": candidate}
+        write_json(path.with_name(f"review-progress-{payload['atoms_hash'][:12]}.json"), payload)
+        write_json(path, payload)
+    return candidate
+
+
 def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: Path) -> dict:
+    if config.get("relation_review", False) and not config.get("evidence_contract_review", False):
+        raise JudgeError("relation_review requires evidence_contract_review")
     workspace, manifest = workspace_for(task, subject, config, project, run_dir)
     model = config.get("model", "aiaaa/deepseek-v4.1-flash#high")
     major = int(config.get("opencode_major", 1))
@@ -226,7 +270,12 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
     except (OSError, ValueError):
         existing = None
     if (config.get("critical_error_review", False) and isinstance(existing, dict)
-            and existing.get("fingerprint") == manifest["fingerprint"] and result_is_consistent(task, existing)):
+            and existing.get("fingerprint") == manifest["fingerprint"] and result_is_consistent(task, existing)
+            and (not config.get("evidence_contract_review", False)
+                 or existing.get("evidence_contract_review", {}).get("status") == "passed")
+            and (not config.get("relation_review", False)
+                 or (existing.get("relation_inventory", {}).get("status") == "passed"
+                     and existing.get("relation_inventory", {}).get("version") == 1))):
         if existing.get("critical_error_review_version") == 1:
             return existing
         # Reuse authoritative locked records, rather than rebuilding them from
@@ -432,14 +481,53 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
                                               task_id=task.id, subject=subject, workspace=workspace,
                                               fingerprint=manifest["fingerprint"], known_files=known_files,
                                               project=project, model=model, major=major)
+    relation_inventory = None
+    if config.get("relation_review", False):
+        from .relation_inventory import inventory_relations
+        relation_inventory = inventory_relations(task, workspace=workspace, project=project,
+            known_files=known_files, model=model, major=major,
+            timeout=config.get("relation_review_timeout_seconds", 1800))
+    contract_review = None
+    if config.get("evidence_contract_review", False):
+        records = _review_progress(task, records, workspace=workspace,
+            fingerprint=manifest["fingerprint"], known_files=known_files)
+        from .contract_review import review_contract
+        records, contract_review = review_contract(task, records, workspace=workspace, project=project,
+            known_files=known_files, model=model, major=major,
+            timeout=config.get("contract_review_timeout_seconds", 1800), relation_inventory=relation_inventory)
     decisions = _error_decisions(task, subject, manifest, records, known_files, workspace, session)
     critical_review = None
+    review_reconciliation = None
     if config.get("critical_error_review", False):
         from .critical_review import review_critical
+        before_critical = _digest(records)
         records, decisions, critical_review = review_critical(task, records, decisions, known_files=known_files,
             workspace=workspace, project=project, model=model, major=major,
             timeout=config.get("critical_review_timeout_seconds", 900),
             scoped_input=config.get("critical_review_scoped_input", False))
+        if config.get("evidence_contract_review", False) and _digest(records) != before_critical:
+            reviewed_critical_records = _digest(records)
+            records, contract_review = review_contract(task, records, workspace=workspace, project=project,
+                known_files=known_files, model=model, major=major,
+                timeout=config.get("contract_review_timeout_seconds", 1800), relation_inventory=relation_inventory)
+            if _digest(records) != reviewed_critical_records:
+                decisions = _error_decisions(task, subject, manifest, records, known_files, workspace, session)
+                before_final_critical = _digest(records)
+                contested_decisions = decisions
+                records, decisions, critical_review = review_critical(task, records, decisions, known_files=known_files,
+                    workspace=workspace, project=project, model=model, major=major,
+                    timeout=config.get("critical_review_timeout_seconds", 900),
+                    scoped_input=config.get("critical_review_scoped_input", False))
+                if _digest(records) != before_final_critical:
+                    _review_progress(task, records, workspace=workspace,
+                        fingerprint=manifest["fingerprint"], known_files=known_files, save=True)
+                    from .reconciliation import reconcile_reviews
+                    records, decisions, review_reconciliation = reconcile_reviews(task, records, decisions,
+                        contested_decisions=contested_decisions, contract_review=contract_review,
+                        critical_review=critical_review, relation_inventory=relation_inventory,
+                        workspace=workspace, project=project, known_files=known_files, model=model, major=major,
+                        timeout=config.get("contract_review_timeout_seconds", 1800))
+                    contract_review = review_reconciliation
     result = {
         "task_id": task.id, "task_name": task.name, "dimension": task.dimension,
         "subject": subject, "fingerprint": manifest["fingerprint"],
@@ -453,5 +541,11 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
             result["critical_error_review"] = critical_review
         if not result_is_consistent(task, result):
             raise JudgeError("Critical review changed the cross-atom sample consistency")
+    if contract_review is not None:
+        result["evidence_contract_review"] = contract_review
+    if review_reconciliation is not None:
+        result["review_reconciliation"] = review_reconciliation
+    if relation_inventory is not None:
+        result["relation_inventory"] = relation_inventory
     write_json(run_dir / "results" / task.id / f"{subject}.json", result)
     return result

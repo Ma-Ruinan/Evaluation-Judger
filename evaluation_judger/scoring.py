@@ -25,7 +25,7 @@ def claim_label(item: dict) -> str:
     """Read semantic claim text from supported response aliases, never locators/IDs."""
     if not isinstance(item, dict):
         return ""
-    return str(next((item[key] for key in ("claim", "element", "statement", "subject", "item", "name")
+    return str(next((item[key] for key in ("claim", "element", "statement", "subject", "item", "name", "claim_group", "checkpoint")
                      if item.get(key)), ""))
 
 

@@ -6,7 +6,7 @@ import json
 import re
 
 from .opencode import JudgeError, extract_json, run, parse_events, event_session
-from .scoring import number, shared_items_match, validate_atom, normalize_evidence_files, evidence_has_content, is_source_url
+from .scoring import number, claim_label, shared_items_match, validate_atom, normalize_evidence_files, evidence_has_content, is_source_url
 
 
 def review_context(task, records, decisions):
@@ -48,7 +48,15 @@ def check_review(task, records, decisions, payload, known_files):
         if atoms[identifier].kind == "CLAIM-RATIO" and (
                 number(reviewed["denominator"]) != number(previous["denominator"]) or
                 not shared_items_match(previous["items"], reviewed["items"])):
-            raise ValueError("Critical review must preserve the locked factual claim sample")
+            first_mismatch = next((i for i, (before, after) in enumerate(zip(previous["items"], reviewed["items"]))
+                                   if not shared_items_match([before], [after])), None)
+            detail = (f"; first mismatch at item {first_mismatch + 1}: locked claim="
+                      f"{claim_label(previous['items'][first_mismatch])!r}, returned claim="
+                      f"{claim_label(reviewed['items'][first_mismatch])!r}" if first_mismatch is not None else "")
+            raise ValueError(f"Critical review must preserve the locked factual claim sample for {identifier}; "
+                             f"locked/returned denominator={previous['denominator']}/{reviewed['denominator']}, "
+                             f"item count={len(previous['items'])}/{len(reviewed['items'])}" + detail +
+                             "; copy each original semantic claim unchanged in order, changing only its decision/evidence.")
         indexed[identifier] = reviewed
     errors = payload.get("errors")
     if not isinstance(errors, list) or {entry.get("id") for entry in errors} != set(rules) or len(errors) != len(rules):
@@ -125,7 +133,8 @@ Return every error code in errors [{id,triggered,reason,evidence:[{file,locator,
                      "original_atoms": [record for record in records if record["id"] in {entry["id"] for entry in review.get("atom_corrections", [])}]}
             write_json(checkpoint, saved)
             return updated, errors, saved
-        except (ValueError, KeyError, TypeError, JudgeError):
+        except (ValueError, KeyError, TypeError, JudgeError) as exc:
+            failure = str(exc)  # Resume carries the previous exact validation diagnostic.
             continue
     for attempt in range(2):
         event_index = len(matching_events) + attempt

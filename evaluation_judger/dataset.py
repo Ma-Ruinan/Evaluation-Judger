@@ -191,6 +191,10 @@ def task_fingerprint(task: Task, subject: str, config: dict) -> str:
     if executed_at is not None:
         payload["execution_date"] = str(executed_at)
     payload["judge_version"] = "0.1"
+    if config.get("evidence_contract_review", False):
+        payload["evidence_contract_version"] = 1
+    if config.get("relation_review", False):
+        payload["relation_review_version"] = 1
     if "temperature" in config:
         temperature = config["temperature"]
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:

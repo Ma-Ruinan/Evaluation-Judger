@@ -31,8 +31,8 @@ class CriticalEvidenceReview(TestCase):
             records.append({'id': 'T01', 'state': 1})
             response = {'errors': [{'id': 'E01', 'triggered': False, 'reason': '先前反证没有针对同一个时间和命题，无法支持这一重大错误判定。'}], 'atom_corrections': []}
             def reply(*args, **kwargs):
-                limited = json.loads((root / 'critical-review-input.json').read_text())
-                full = json.loads((root / 'critical-review-full-input.json').read_text())
+                limited = json.loads((root / 'critical-review-input.json').read_text(encoding='utf-8'))
+                full = json.loads((root / 'critical-review-full-input.json').read_text(encoding='utf-8'))
                 self.assertEqual([r['id'] for r in limited['atoms']], ['H01'])
                 self.assertEqual(len(full['atoms']), 2)
                 return json.dumps(response), True
@@ -79,6 +79,30 @@ class CriticalEvidenceReview(TestCase):
                 with patch('evaluation_judger.critical_review.run') as cached:
                     review_critical(task, records, errors, known_files={'delivery.md'}, workspace=root, project=root, model='model', major=1)
                 cached.assert_not_called()
+
+    def test_resume_explains_locked_claim_mismatch_and_accepts_semantic_alias(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder); (root / 'events').mkdir()
+            task, records, errors = self.fixture(); task.id = 'demo'
+            atom = task.rubric.atoms[0]; atom.kind = 'CLAIM-RATIO'
+            rule = task.rubric.errors[0]; rule.trigger = '实质虚构'; rule.effects = '幻觉封顶'
+            records[0].update(numerator=0, denominator=1,
+                             items=[{'checkpoint': '报告称本期营业收入同比增长百分之十', 'result': '不支持', 'location': 'L1'}])
+            correction = {**records[0], 'state': 1, 'numerator': 1,
+                          'items': [{'claim_group': '报告称本期营业收入同比增长百分之十', 'result': '支持', 'location': 'L1'}]}
+            valid = {'errors': [{'id': 'E01', 'triggered': False, 'reason': '先前反证没有针对同一个时间和命题，无法支持这一重大错误判定。'}], 'atom_corrections': [correction]}
+            bad = {**valid, 'atom_corrections': [{**correction, 'items': [{'checkpoint': '完全不同的另一项产品价格及发布日期', 'result': '支持', 'location': 'L1'}]}]}
+            payload = {'task': task.id, 'atoms': records, 'errors': errors,
+                       'rules': [{'id': rule.id, 'trigger': rule.trigger, 'effects': rule.effects}]}
+            (root / 'critical-review-input.json').write_text(json.dumps(payload), encoding='utf-8')
+            (root / 'events/critical-evidence-review-0.jsonl').write_text(json.dumps({'sessionID': 'saved', 'type': 'text', 'part': {'text': 'BEGIN_JUDGMENT '+json.dumps(bad)+' END_JUDGMENT'}}), encoding='utf-8')
+            with patch('evaluation_judger.critical_review.run', return_value=(json.dumps(valid), True)) as model:
+                result = review_critical(task, records, errors, known_files={'delivery.md'}, workspace=root, project=root, model='model', major=1)
+            self.assertIn('first mismatch at item 1', model.call_args.args[1])
+            self.assertIn('报告称本期营业收入同比增长百分之十', model.call_args.args[1])
+            self.assertEqual(result[0][0]['state'], '1')
+            self.assertFalse(result[1][0]['triggered'])
+            self.assertEqual(records[0]['state'], 0)
 
     def fixture(self):
         atom = SimpleNamespace(id="H01", metric="hallucination", kind="BIN", weight=Decimal(100), rule="有实际编造证据记0，否则1", purpose="虚构")
