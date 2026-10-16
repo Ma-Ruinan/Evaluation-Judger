@@ -88,9 +88,18 @@ def load_rubric(path: Path) -> Rubric:
             atoms.append(Atom(cells[0], metric, Decimal(cells[2]), cells[1], cells[3], cells[4], cells[5], cells[6], kind_match.group(1)))
         elif in_errors and len(cells) >= 3 and re.fullmatch(r"E\d+", cells[0]):
             caps = {}
+            no_caps = set()
             atom_scopes = {}
             current_metric = None
             for segment in re.split(r"[；;]", cells[2]):
+                no_cap = re.fullmatch(r"\s*(.+?)：(?:无额外上限|无上限|不另设上限)\s*", segment)
+                if no_cap:
+                    found = next((m for m, name in LABELS.items() if name == no_cap.group(1).strip()), None)
+                    if found is None:
+                        raise ValueError(f"Unknown no-cap metric: {path} {cells[0]}")
+                    no_caps.add(found)
+                    current_metric = None
+                    continue
                 match = re.search(r"^\s*(.+?)：上限\s*([\d.]+)", segment)
                 if not match:
                     scope = re.fullmatch(r"\s*原子\s+([A-Z]\d+(?:\s*[、,，]\s*[A-Z]\d+)*)\s*", segment)
@@ -107,7 +116,7 @@ def load_rubric(path: Path) -> Rubric:
                 if found:
                     caps[found] = Decimal(value)
                 current_metric = found
-            if cells[2].count("上限") != len(caps):
+            if cells[2].count("上限") != len(caps) + len(no_caps) or no_caps.intersection(caps):
                 raise ValueError(f"Unparsed critical-error cap: {path} {cells[0]}")
             errors.append(ErrorRule(cells[0], cells[1], cells[2], caps, atom_scopes))
     if not atoms or set(a.metric for a in atoms) != set(METRICS):

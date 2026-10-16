@@ -35,6 +35,16 @@ uv run evaluation-judger status --config config.example.json
 uv run evaluation-judger report --config config.example.json
 ```
 
+需要自动续跑时，使用可选入口：
+
+```powershell
+uv run evaluation-judger run --config config.example.json --auto-resume --max-auto-attempts 4 --auto-retry-delay 30
+```
+
+父调度器调用原来的 `run`，失败后等待指定秒数，复用已校验结果和检查点继续，直至范围内的评分及报告均完成。默认最多四轮；连续三轮没有结果或检查点变化、鉴权错误、明确接口迁移等情况会停止并保留现场，不补零、不伪造报告。尝试预算在启动前保存，再次启动沿用预算；输入或配置变化须使用新的运行目录。独占锁避免重复启动，父进程中断后仍存活的子进程会阻止竞争写入。运行日志、自动续跑状态及子进程 PID 保存到 `operation-records/`。不带此参数的原有运行方式保持不变。
+
+正式报告在自动续跑模式下还须通过正文独立复核，且与当前报告事实表匹配。降级摘要会保留供查看，但不会被当作全部完成；程序会复用已锁定评分及报告草稿继续修订，报告审核变化也计入恢复进展。
+
 `run` 会处理本轮配置的全部题目。单个对象失败时会保存错误并继续其他对象和题目；再次运行会复用已完成结果、从有效的原子批次检查点续跑。只有配置范围内的结果全部齐全，才生成该范围的报告。`report` 仅使用已完成、输入指纹仍匹配的判分结果。一次运行的输出在配置的 `run_dir` 下：
 
 - `workspaces/<题号>/<对象>/<输入指纹>/`：隔离的题目材料、OpenCode 原始事件和逐批检查点。

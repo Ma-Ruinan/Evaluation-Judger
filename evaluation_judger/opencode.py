@@ -119,7 +119,10 @@ def parse_events(raw: str) -> tuple[str, str | None, bool]:
 
 
 def extract_json(text: str, *, allow_array: bool = False) -> dict | list:
-    block = re.search(r"BEGIN_JUDGMENT\s*(.*?)\s*END_JUDGMENT", text, re.S)
+    # Continuations may echo instructions mentioning both marker names.
+    # Prefer actual standalone delimiter lines; retain legacy inline replies.
+    block = (re.search(r"^[ \t]*BEGIN_JUDGMENT[ \t]*\r?\n(.*?)^[ \t]*END_JUDGMENT[ \t]*\r?$", text, re.S | re.M)
+             or re.search(r"BEGIN_JUDGMENT\s*(.*?)\s*END_JUDGMENT", text, re.S))
     payload = block.group(1) if block else text
     payload = re.sub(r"^```(?:json)?\s*|\s*```$", "", payload.strip(), flags=re.I)
     try:
@@ -191,6 +194,9 @@ class TaskSession:
 
 def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, model: str, timeout: int = 900, major: int = 1, *, session_id: str | None = None, _continue_length: bool = True, agent: str = "judge") -> tuple[str, bool]:
     env = environment(project)
+    # Git Bash exports its own PWD; subprocess cwd alone does not update it.
+    # OpenCode uses PWD when routing sessions and must see this isolated scope.
+    env["PWD"] = str(workspace.resolve())
     if timeout == 900:
         timeout = int(env.get("OPENCODE_REQUEST_TIMEOUT_SECONDS", "900"))
     if timeout < 1:

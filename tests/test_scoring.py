@@ -13,6 +13,20 @@ from types import SimpleNamespace
 
 
 class ScoringContract(TestCase):
+    def test_explicit_no_extra_cap_does_not_introduce_a_penalty(self):
+        headings = ['## 6. 完成率', '### 7.1 覆盖度', '### 7.2 准确率', '### 7.3 格式', '### 7.4 结构', '### 7.5 自洽性']
+        atoms = ['T01', 'C01', 'A01', 'F01', 'S01', 'H01']
+        text = '\n'.join(h + '\n| ' + atom + ' | L1 | 100 | 测试要求 | **BIN**：符合为1 | 明确证据 | 题面 |' for h, atom in zip(headings, atoms))
+        text += '\n## 8. 关键错误\n| E01 | 明确错误 | 准确率·忠实度：无额外上限；原子 A01；任务完成率：上限 80 |\n## 9. 结束\n'
+        with TemporaryDirectory() as folder:
+            p = Path(folder) / 'rubric.md'; p.write_text(text, encoding='utf-8')
+            rubric = load_rubric(p)
+            self.assertEqual(rubric.errors[0].caps, {'completion': Decimal(80)})
+            self.assertFalse(rubric.errors[0].atom_scopes)
+            p.write_text(text.replace('无额外上限', '上限 待确定'), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Unparsed critical-error cap'):
+                load_rubric(p)
+
     def test_excluded_sample_members_do_not_create_a_false_count_warning(self):
         items = [{"claim": "qualitative", "result": 1}, {"claim": "contradiction", "result": 0},
                  {"claim": "numeric", "result": "排除（数值由另一原子负责）"}]

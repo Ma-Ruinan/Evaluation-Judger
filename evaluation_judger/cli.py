@@ -145,8 +145,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate one rubric dataset with OpenCode")
     parser.add_argument("command", choices=["prepare", "run", "status", "report"])
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--auto-resume", action="store_true", help="有界自动续跑；复用原生有效检查点，直到报告完成或重试上限")
+    parser.add_argument("--max-auto-attempts", type=int, default=4)
+    parser.add_argument("--auto-retry-delay", type=float, default=30)
     args = parser.parse_args(argv)
+    if args.auto_resume and args.command != "run":
+        parser.error("--auto-resume is only valid with run")
     config, project, run_dir, tasks = _context(args.config)
+    if args.auto_resume:
+        from .supervisor import supervise
+        raise SystemExit(supervise(args.config, config, project, run_dir, tasks,
+                                   max_attempts=args.max_auto_attempts, retry_delay=args.auto_retry_delay))
     print(f"Dataset: {config['dataset']} | tasks: {len(tasks)} | subjects: {len(config['subjects'])} | run: {run_dir}", flush=True)
     if args.command == "prepare":
         for task in tasks:

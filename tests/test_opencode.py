@@ -12,6 +12,33 @@ from evaluation_judger.opencode import JudgeError, TaskSession, run, probe, extr
 
 
 class InterruptedOutput(TestCase):
+    def test_echoed_marker_names_do_not_hide_the_actual_json_block(self):
+        text = 'Return JSON between BEGIN_JUDGMENT and END_JUDGMENT.\n\nBEGIN_JUDGMENT\n{"ok":false,"issues":["修正事实归因"]}\nEND_JUDGMENT'
+        self.assertEqual(extract_json(text), {'ok': False, 'issues': ['修正事实归因']})
+        with self.assertRaisesRegex(JudgeError, 'Expected JSON object'):
+            extract_json('BEGIN_JUDGMENT\n[]\nEND_JUDGMENT')
+
+    def test_subprocess_pwd_matches_workspace_for_both_call_paths(self):
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming), TemporaryDirectory() as folder:
+                project = Path(folder)
+                workspace = project / 'isolated'; workspace.mkdir()
+                env = {'AIAAA_API_KEY': 'test-key', 'PWD': str(project)}
+                if streaming:
+                    env['OPENCODE_FIRST_EVENT_TIMEOUT_SECONDS'] = '180'
+                event = json.dumps({'type': 'text', 'part': {'text': 'BEGIN_JUDGMENT {"ok":true} END_JUDGMENT'}})
+                called = []
+                def request(command, **kwargs):
+                    called.append(kwargs)
+                    self.assertEqual(kwargs['cwd'], workspace)
+                    self.assertEqual(kwargs['env']['PWD'], str(workspace.resolve()))
+                    return subprocess.CompletedProcess(command, 0, event, '')
+                target = 'evaluation_judger.opencode._run_with_first_event_timeout' if streaming else 'evaluation_judger.opencode.subprocess.run'
+                with patch('evaluation_judger.opencode.environment', return_value=dict(env)), patch('evaluation_judger.opencode._executable', return_value='opencode'), patch(target, side_effect=request):
+                    run(workspace, 'prompt', 'title', workspace / 'events.jsonl', project, 'provider/model')
+                self.assertEqual(len(called), 1)
+                self.assertEqual(env['PWD'], str(project))
+
     def test_events_are_persisted_before_an_interrupted_request_finishes(self):
         with TemporaryDirectory() as folder:
             root = Path(folder); logged = threading.Event(); failures = []

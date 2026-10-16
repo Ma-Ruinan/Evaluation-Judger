@@ -10,7 +10,7 @@ from pypdf import PdfWriter
 from pypdf.annotations import Link
 
 from evaluation_judger.materials import extract, structured_evidence
-from evaluation_judger.contract_review import count_issues, validate_review, review_contract
+from evaluation_judger.contract_review import count_issues, validate_review, review_contract, _merge_review_patch
 from evaluation_judger.rubric import METRICS
 
 
@@ -25,6 +25,76 @@ def fixture():
 
 
 class ContractReviewTests(TestCase):
+    def test_local_patch_preserves_other_corrections_and_ledger_then_revalidates_all(self):
+        task,records=fixture()
+        kept={**records[1],'state':'0','observation':'该要求的具体内容缺失，已核对交付对应位置。'}
+        broken={**records[2],'reason':'理由不足'}
+        candidate={'checks':{k:'独立核对了全部原始证据及固定规则' for k in ('file_coverage','item_accounting','ownership','internal_consistency')},
+                   'defects':[{'id':'D1','description':'交付对应位置缺少该项具体内容',
+                       'evidence':kept['evidence'],'owners':[{'atom_id':kept['id'],'metric':kept['metric'],'consequence':'该项内容缺失，按固定规则记零'}]}],
+                   'corrections':[kept,broken]}
+        repair={'review_patch':{'corrections':[{**broken,'reason':records[2]['reason']}]}}
+        with TemporaryDirectory() as folder:
+            root=Path(folder);(root/'checkpoints').mkdir()
+            with patch('evaluation_judger.contract_review.run',side_effect=[
+                    ('BEGIN_JUDGMENT '+json.dumps(candidate)+' END_JUDGMENT',True),
+                    ('BEGIN_JUDGMENT '+json.dumps(repair)+' END_JUDGMENT',True)]) as model:
+                final,review=review_contract(task,records,workspace=root,project=root,known_files={'delivery.md'},model='mock',major=1)
+            self.assertEqual(review['status'],'passed')
+            self.assertEqual(final[1]['state'],'0')
+            self.assertEqual(review['review']['defects'],candidate['defects'])
+            self.assertIn('reason has 4 characters, minimum 20',model.call_args_list[1].args[1])
+            self.assertIn('review_patch',model.call_args_list[1].args[1])
+            files=sorted(root.glob('contract-review-candidate-*.json'))
+            self.assertEqual(json.loads(files[0].read_text(encoding='utf-8')),candidate)
+            self.assertTrue(list((root/'events').glob('*-patch.json')))
+            with patch('evaluation_judger.contract_review.run') as model:
+                cached=review_contract(task,records,workspace=root,project=root,known_files={'delivery.md'},model='mock',major=1)
+            model.assert_not_called();self.assertEqual(cached[0],final)
+
+    def test_patch_never_bypasses_original_gates_or_infers_a_base(self):
+        task,records=fixture()
+        draft={'checks':{k:'已核对原始内容与规则依据' for k in ('file_coverage','item_accounting','ownership','internal_consistency')},'defects':[],'corrections':[]}
+        with self.assertRaisesRegex(ValueError,'saved candidate'):
+            _merge_review_patch({'review_patch':{}},None)
+        with self.assertRaisesRegex(ValueError,'distinct atom IDs'):
+            _merge_review_patch({'review_patch':{'corrections':[records[0],records[0]]}},draft)
+        bad={'review_patch':{'corrections':[{**records[0],'reason':'过短'}]}}
+        with self.assertRaisesRegex(ValueError,'too vague'):
+            validate_review(_merge_review_patch(bad,draft),task,records,{'delivery.md'})
+        unknown={'review_patch':{'corrections':[{**records[0],'id':'UNKNOWN'}]}}
+        with self.assertRaisesRegex(ValueError,'Unknown or duplicate'):
+            validate_review(_merge_review_patch(unknown,draft),task,records,{'delivery.md'})
+        # Complete reviews retain their previous replacement semantics.
+        self.assertIs(_merge_review_patch(draft,{'corrections':[records[0]]}),draft)
+
+    def test_patch_cannot_hide_unrepaired_count_failure(self):
+        task,records=fixture()
+        task.rubric.atoms[1].kind='RATIO'
+        counted={**records[1],'kind':'RATIO','numerator':4,'denominator':4,'items':[{'claim':'only one example'}]}
+        draft={'checks':{k:'已核对原始内容与规则依据' for k in ('file_coverage','item_accounting','ownership','internal_consistency')},'defects':[],'corrections':[counted]}
+        merged=_merge_review_patch({'review_patch':{'checks':{'ownership':'保留全部原子，具体缺陷归属已核对'}}},draft)
+        with self.assertRaisesRegex(ValueError,'denominator 4 has 1'):
+            validate_review(merged,task,records,{'delivery.md'})
+        counted['items']=[{'method':'material_inspector operation=xml','scope':'verified range','location':'delivery.md','count':4}]
+        self.assertTrue(count_issues(counted))
+        counted['items'][0]['method']='material_inspector'
+        self.assertEqual(count_issues(counted),[])
+
+    def test_latest_saved_feedback_survives_scanning_older_events(self):
+        import hashlib
+        task,records=fixture()
+        payload={'checks':{k:'独立核查全部原始材料与规则' for k in ('file_coverage','item_accounting','ownership','internal_consistency')},'defects':[],'corrections':[]}
+        digest=hashlib.sha256(json.dumps({'rubric':task.rubric.text,'atoms':records},ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+        with TemporaryDirectory() as folder:
+            root=Path(folder);(root/'checkpoints').mkdir();(root/'events').mkdir()
+            (root/'checkpoints'/f'contract-review-{digest[:12]}.json').write_text(json.dumps({'input_hash':digest,'status':'incomplete','error':'LATEST SPECIFIC DIAGNOSTIC'}))
+            (root/'events'/f'contract-{digest[:12]}-0.jsonl').write_text(json.dumps({'sessionID':'old','type':'text','part':{'text':'BEGIN_JUDGMENT {} END_JUDGMENT'}}))
+            with patch('evaluation_judger.contract_review.run',return_value=('BEGIN_JUDGMENT '+json.dumps(payload)+' END_JUDGMENT',True)) as model:
+                _,review=review_contract(task,records,workspace=root,project=root,known_files={'delivery.md'},model='mock',major=1)
+            self.assertEqual(review['status'],'passed')
+            self.assertTrue(model.call_args.args[1].endswith('Specific validation feedback: LATEST SPECIFIC DIAGNOSTIC'))
+
     def test_html_preserves_link_targets_and_empty_reference_values(self):
         with TemporaryDirectory() as folder:
             p=Path(folder)/'report.html'

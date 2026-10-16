@@ -38,9 +38,38 @@ def count_issues(record: dict) -> list[str]:
         else:
             total += 1
     return [] if total == int(record['denominator']) else [
-        f"{record['id']}: denominator {record['denominator']} has only {total} explicitly accounted elements; "
-        'expand grouped entries into members, or supply an exact inspector scope/count. Uniform templates are not evidence.'
+        f"{record['id']}: denominator {record['denominator']} has {total} explicitly accounted elements; "
+        'expand grouped entries into members, or supply an exact inspector scope/count. '
+        'For an actually verified aggregate, method must be exactly "material_inspector"; put the operation '
+        'description in a separate field, and supply scope, location and count. Count disjoint groups once; '
+        'keep overlapping examples in observation/evidence, not as additional counted items. Uniform templates are not evidence.'
     ]
+
+
+def _merge_review_patch(payload, draft):
+    """An explicit patch retains the same-input candidate, never bypassing validation."""
+    if not isinstance(payload, dict) or 'review_patch' not in payload:
+        return payload  # Existing complete-review responses keep their meaning.
+    patch = payload['review_patch']
+    if not isinstance(draft, dict) or not isinstance(patch, dict):
+        raise ValueError('review_patch needs a saved candidate and an object of changed fields.')
+    if set(patch) - {'checks', 'defects', 'corrections', 'relation_findings'}:
+        raise ValueError('review_patch contains unknown fields; use the existing review fields.')
+    merged = {**draft, **patch}
+    if 'checks' in patch:
+        if not isinstance(draft.get('checks', {}), dict) or not isinstance(patch['checks'], dict):
+            raise ValueError('Patched checks must be an object.')
+        merged['checks'] = {**draft.get('checks', {}), **patch['checks']}
+    previous, updates = draft.get('corrections', []), patch.get('corrections', [])
+    for entries in (previous, updates):
+        if (not isinstance(entries, list)
+                or any(not isinstance(a, dict) or not isinstance(a.get('id'), str) for a in entries)
+                or len({a['id'] for a in entries}) != len(entries)):
+            raise ValueError('Patch corrections need distinct atom IDs and complete atom records.')
+    by_id = {a['id']: a for a in previous}
+    by_id.update({a['id']: a for a in updates})
+    merged['corrections'] = list(by_id.values())
+    return merged
 
 
 def validate_review(payload, task, records, known_files, *, relation_inventory=None):
@@ -51,10 +80,23 @@ def validate_review(payload, task, records, known_files, *, relation_inventory=N
         raise ValueError('Explain all four checks, including no-defect findings.')
     by_id = {a.id:a for a in task.rubric.atoms}
     replacement = {}
+    atom_issues = []
+    seen = set()
     for raw in payload['corrections']:
-        if not isinstance(raw, dict) or not isinstance(raw.get('id'),str) or raw['id'] not in by_id or raw['id'] in replacement:
+        if not isinstance(raw, dict) or not isinstance(raw.get('id'),str) or raw['id'] not in by_id or raw['id'] in seen:
             raise ValueError('Unknown or duplicate corrected atom.')
-        replacement[raw['id']] = validate_atom(raw, by_id[raw['id']], known_files)
+        seen.add(raw['id'])
+        try:
+            replacement[raw['id']] = validate_atom(raw, by_id[raw['id']], known_files)
+        except ValueError as exc:
+            detail = str(exc)
+            if 'observation/reason is too vague' in detail:
+                detail += (f" (observation has {len(str(raw.get('observation', '')).strip())} characters, minimum 8; "
+                           f"reason has {len(str(raw.get('reason', '')).strip())} characters, minimum 20). "
+                           'Explain the inspected finding and its rubric consequence; do not pad generic text.')
+            atom_issues.append(detail)
+    if atom_issues:
+        raise ValueError('; '.join(atom_issues))
     final = [replacement.get(r['id'], r) for r in records]
     issues = [s for r in final for s in count_issues(r)]
     if issues:
@@ -161,6 +203,16 @@ does not establish support. Historical fairness prevents penalties for later dri
 If evidence is limited, apply the fixed rubric's uncertainty rule and explain the limitation without inventing a defect.
 For each counted element, provide its own result/location. Grouped entries require explicit members, or a verified exact
 material_inspector aggregate with method, scope, location and count. Preserve every failed finding and map outcomes to operands.
+Use this existing aggregate schema ONLY for an actually verified exact calculation:
+{"claim":"the inspected group and outcome","method":"material_inspector","operation":"actual query/calculation",
+"scope":"exact authorized document/paragraph or cell range and criterion","location":"original material locator",
+"count":2,"result":"supported"}. The 2 is an illustrative count, not a task operand. The method value must be exactly
+material_inspector; put query details in operation. A tool name, rubric population count or XML preview alone is not a verified
+aggregate. Otherwise enumerate explicit members with supported outcomes/locations. Count disjoint groups only once. Do not
+put an all-items aggregate AND overlapping examples in items: retain those examples in observation/evidence, including every
+concrete failed finding. Keep numerator, denominator and outcomes supported by the inspected scope.
+Each corrected atom remains a COMPLETE original-schema record, including observation (at least 8 characters), reason
+(at least 20 characters), evidence, state and applicable ratio fields. Explain facts and the rubric consequence in Chinese.
 If changes are necessary, return COMPLETE corrected atom records using the original grading schema. No manual metric scores.
 Return BEGIN_JUDGMENT JSON with:
 {"checks":{"file_coverage":"Chinese explanation of inspected scope and limitations",
@@ -196,6 +248,7 @@ and recompute operands by the rule. Not inventing a participant defect does not 
                              key=lambda entry: entry.stat().st_mtime_ns, reverse=True)
     session_id = next((event_session(entry) for entry in matching_events if event_session(entry)), None) if major == 1 else None
     prior_read = False
+    replay_failure = ''
     for previous_event in matching_events:
         try:
             previous_answer, _, read = parse_events(previous_event.read_text(encoding='utf-8'))
@@ -208,11 +261,23 @@ and recompute operands by the rule. Not inventing a participant defect does not 
                 write_json(path, saved)
                 return final, saved
         except (OSError, JudgeError, ValueError, KeyError, TypeError) as exc:
-            failure = str(exc)
+            if not replay_failure:
+                replay_failure = str(exc)
+    # Historical scans seek a complete valid result, but must not replace the
+    # newest saved diagnostic with an older rejected response's error.
+    failure = prior_failure or replay_failure or failure
     for attempt in range(2):
         try:
             repair_context = (f'\nRead {candidate.name} as a rejected candidate, not factual proof. Preserve independently verified findings, repair the stated validation problem, and check relevant original evidence; return the complete review.' if candidate else '')
-            continuation = ('\nContinue the interrupted review in THIS SAME INPUT session. Reuse already inspected evidence and return complete judgment; do not repeat completed research without a specific need.' if session_id else '')
+            if candidate:
+                repair_context += ('\nFor a local repair, prefer {"review_patch":{"corrections":[]}}, putting ONLY changed complete atom records in that list. '
+                    'The program merges this explicit patch into that saved candidate by atom ID, keeping other records. '
+                    'You may also patch checks by key; defects and relation_findings, when supplied, replace their entire lists. '
+                    'Reconcile those lists if the corrected findings affect them. To withdraw an earlier atom correction, '
+                    'return its complete original decision. A complete review remains supported and replaces the candidate. '
+                    'Unchanged records are not assumed true: inspect their evidence as needed. The merged review must pass '
+                    'all original evidence, accounting, ownership, relation and shared-sample checks before completion.')
+            continuation = ('\nContinue the interrupted review in THIS SAME INPUT session. Reuse already inspected evidence and return the requested complete review or explicit local patch; do not repeat completed research without a specific need.' if session_id else '')
             active_session = session_id
             answer, used_read = run(workspace, prompt + repair_context + continuation + ('\nSpecific validation feedback: '+failure if failure else ''),
                 f'contract review {task.id}', events/f'contract-{digest[:12]}-{offset+attempt}.jsonl',
@@ -221,6 +286,10 @@ and recompute operands by the rule. Not inventing a participant defect does not 
             if not used_read and not (active_session and prior_read):
                 raise ValueError('Independent review did not read its input or material evidence; use the read tool.')
             payload = extract_json(answer)
+            if isinstance(payload, dict) and 'review_patch' in payload:
+                write_json(events/f'contract-{digest[:12]}-{offset+attempt}-patch.json', payload)
+                draft = json.loads(candidate.read_text(encoding='utf-8')) if candidate else None
+                payload = _merge_review_patch(payload, draft)
             candidate = workspace/f'contract-review-candidate-{digest[:12]}-{offset+attempt}.json'
             write_json(candidate, payload)
             final, review = validate_review(payload, task, records, known_files, relation_inventory=relation_inventory)
