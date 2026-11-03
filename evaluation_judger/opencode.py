@@ -159,6 +159,7 @@ class TaskSession:
         self.fingerprint = fingerprint
         self.checkpoint = workspace / "checkpoints" / "judge-session.json"
         self.session_id = None
+        self.resets = []
         if major != 1:
             return
         recover_events = not self.checkpoint.exists()
@@ -167,6 +168,8 @@ class TaskSession:
                 saved = json.loads(self.checkpoint.read_text(encoding="utf-8"))
                 if not isinstance(saved, dict):
                     raise ValueError("Invalid session checkpoint")
+                if saved.get("fingerprint") == fingerprint and isinstance(saved.get("resets"), list):
+                    self.resets = saved["resets"]
                 if saved.get("fingerprint") == fingerprint and isinstance(saved.get("session_id"), str):
                     self.session_id = saved["session_id"]
             except (OSError, ValueError, TypeError):
@@ -177,6 +180,23 @@ class TaskSession:
                 if self.session_id:
                     break
 
+    def _save(self) -> None:
+        self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.checkpoint.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps({"fingerprint": self.fingerprint, "session_id": self.session_id,
+                                         "resets": self.resets}), encoding="utf-8")
+        temporary.replace(self.checkpoint)
+
+    def restart(self, reason: str) -> None:
+        """Drop stale dialogue only; validated evidence checkpoints stay intact."""
+        if self.major != 1:
+            return
+        self.resets.append({"previous_session_id": self.session_id, "reason": reason, "at": time.time()})
+        self.session_id = None
+        # Persist the explicit null so a restart interrupted before the next
+        # response does not rediscover the stale session in historical events.
+        self._save()
+
     def ask(self, prompt: str, title: str, output: Path) -> tuple[str, bool]:
         try:
             return run(self.workspace, prompt, title, output, self.project, self.model,
@@ -186,10 +206,7 @@ class TaskSession:
                 session = event_session(output)
                 if session:
                     self.session_id = session
-                    self.checkpoint.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = self.checkpoint.with_suffix(".json.tmp")
-                    temporary.write_text(json.dumps({"fingerprint": self.fingerprint, "session_id": session}), encoding="utf-8")
-                    temporary.replace(self.checkpoint)
+                    self._save()
 
 
 def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, model: str, timeout: int = 900, major: int = 1, *, session_id: str | None = None, _continue_length: bool = True, agent: str = "judge") -> tuple[str, bool]:
@@ -220,7 +237,12 @@ def run(workspace: Path, prompt: str, title: str, output: Path, project: Path, m
         prompt_file = workspace / "prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
         # yargs treats arguments after --file as additional file names.
-        command += ["Read the attached UTF-8 prompt and follow it. Return only the requested JSON markers.", "--file", "prompt.txt"]
+        lines = len(prompt.splitlines())
+        command += [f"Follow the current request in the attached UTF-8 prompt.txt ({lines} lines). "
+                    "The attachment preview may be truncated. If any content is omitted, use read on prompt.txt "
+                    "with explicit offset/limit in bounded segments and continue through the final line before "
+                    "answering; do not treat the preview as the whole prompt. This request supersedes earlier "
+                    "assignments in this session. Return only the requested JSON markers.", "--file", "prompt.txt"]
     else:
         command.append(prompt)
     first_event_timeout = int(env.get("OPENCODE_FIRST_EVENT_TIMEOUT_SECONDS", "0"))

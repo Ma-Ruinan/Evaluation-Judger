@@ -139,6 +139,10 @@ def workspace_for(task: Task, subject: str, config: dict, project: Path, run_dir
         manifest["image_input"] = True
     manifest["files"].append({"category": "process", "file": "process-record.json", "extracted": "process-record.json", "limitation": None})
     write_json(workspace / "manifest.json", manifest)
+    # A line-oriented view keeps every authorized path accessible in bounded
+    # read calls. The manifest remains the unchanged evidence whitelist.
+    write_text(workspace / "material-files.jsonl", "\n".join(
+        json.dumps(item, ensure_ascii=False) for item in manifest["files"]) + "\n")
     if config.get("enable_material_inspector", False):
         install_tool(workspace)
     return workspace, manifest
@@ -148,19 +152,49 @@ def _prompt(task: Task, subject: str, atoms, manifest: dict, previous_error: str
     image_note = ("This model is configured for image input. For image or visual atoms, use the read tool on the listed original PNG/JPEG/WebP files; empty extracted text does not mean an image delivery is missing. Inspect actual labels, axes, chart type and visible content, then compare numerical requirements with verified source anchors. Cite the original image and a concrete visual locator. When there is no literal text to quote, evidence may use kind=visual and description containing the specific visible observation (at least 8 characters), with file and locator still required. Such visual evidence does not require a quote. Do not invent literal quotes where no text is visible, or infer precise numerical values from unreadable pixels. Controlled preview screenshots can also be read as images; bind their findings to the listed original file. Do not execute delivered plotting code." if manifest.get("image_input") else "")
     files = [f"- {item['file']} => {item['extracted']}" + (f" [modified {item['modified_at']}]" if item.get("modified_at") else "") + (f" [LIMITATION: {item['limitation']}]" if item["limitation"] else "") for item in manifest["files"]]
     naming = {item["file"]: item["logical_name"] for item in manifest["files"] if "logical_name" in item}
-    naming_note = ("Confirmed collection convention: subject/task prefixes were added during archival, not by the participant. For rubric filename checks, use these logical delivery filenames after removing ONLY the confirmed archival labels. All content/format requirements still apply. Cite the unchanged collected path in evidence; never invent or rename a file. Mapping: " + json.dumps(naming, ensure_ascii=False)) if naming else ""
+    compact_inventory = len("\n".join(files)) + len(json.dumps(naming, ensure_ascii=False)) > 6_000
+    if compact_inventory:
+        counts = {category: sum(item.get("category") == category for item in manifest["files"])
+                  for category in dict.fromkeys(item.get("category", "other") for item in manifest["files"])}
+        files_note = (f"Inventory has {len(manifest['files'])} entries by category: {json.dumps(counts)}. "
+                      "Read material-files.jsonl in segments with read offset/limit (start at offset=1, limit=20). "
+                      "Each line is one complete manifest entry with category, original file, extracted path, "
+                      "limitations, preserved modification date and logical_name where applicable. "
+                      "Continue from the returned next offset; a truncated excerpt is not the full inventory. "
+                      "Locate the question, rubric, participant reports/attachments and relevant sources. "
+                      "Select files by relevance to the rubric; do not assume the first page is the whole delivery. "
+                      "manifest.json remains the complete authoritative inventory. Inventory size, library files "
+                      "and extraction limitations alone are not participant defects.")
+        # Shallow entry points let a model reach reports hidden after thousands
+        # of nested project files without reading every inventory page first.
+        entry_points = []
+        for category in ("question", "rubric", "sources", "deliveries"):
+            candidates = sorted(enumerate(manifest["files"], 1),
+                                key=lambda pair: (pair[1]["file"].count("/"), pair[1]["file"]))
+            for line, item in [pair for pair in candidates if pair[1].get("category") == category][:12]:
+                entry = f"\n- {item['file']} (material-files.jsonl line {line})"
+                if sum(map(len, entry_points)) + len(entry) <= 3_000:
+                    entry_points.append(entry)
+        files_note += "\nNavigation examples only, NOT the complete material scope:" + "".join(entry_points)
+    else:
+        files_note = "Files:\n" + "\n".join(files)
+    naming_note = ("Confirmed collection convention: subject/task prefixes were added during archival, not by the participant. For rubric filename checks, use these logical delivery filenames after removing ONLY the confirmed archival labels. All content/format requirements still apply. Cite the unchanged collected path in evidence; never invent or rename a file. " + ("Read logical_name alongside file in material-files.jsonl for the mapping." if compact_inventory else "Mapping: " + json.dumps(naming, ensure_ascii=False))) if naming else ""
     rules = [dict(id=a.id, metric=a.metric, weight=str(a.weight), purpose=a.purpose, rule=a.rule, required_evidence=a.evidence) for a in atoms]
     time_notes = [line.strip() for line in task.rubric.text.splitlines() if ("评测基准日" in line or "时间／版本边界" in line)][:5]
-    return f"""You evaluate task {task.id} ({task.name}) for participant {subject}. Use only this participant's delivery, task question, rubric, process record and common sources in this isolated workspace. Read the extracted files with the read tool when they have not already been read in THIS same task-participant session, including the participant delivery and relevant source anchors. Reuse already inspected evidence where applicable; inspect any additional scope required by the assigned atoms. The extracted text has line/page/paragraph locators. Original files are also present when extraction is limited.
+    return f"""CURRENT REQUEST: task {task.id} ({task.name}), participant {subject}.
+Return ONLY these assigned atom IDs, in order: {json.dumps([a.id for a in atoms])}. Do not repeat earlier batches in place of this request.
+{('Previous attempt failed validation: ' + previous_error) if previous_error else ''}
+Assigned rubric atoms (verbatim rule text):\n{json.dumps(rules, ensure_ascii=False, indent=2)}
+Return JSON only between BEGIN_JUDGMENT and END_JUDGMENT, shape: {{"atoms":[...]}}. Each decision needs id, state, observation, reason, evidence and applicable count/item fields, as specified below.
+
+Use only this participant's delivery, task question, rubric, process record and common sources in this isolated workspace. Read the extracted files with the read tool when they have not already been read in THIS same task-participant session, including the participant delivery and relevant source anchors. Reuse already inspected evidence where applicable; inspect any additional scope required by the assigned atoms. The extracted text has line/page/paragraph locators. Original files are also present when extraction is limited.
 {naming_note}
 
-Files:\n{chr(10).join(files)}
+{files_note}
 Read material-index.json for original hyperlinks, PDF URI annotations and JSON reference metadata. Its contents are inventories, not verification outcomes. Apply the rubric's primary-report/attachment policy; equivalent formats may provide complementary evidence when allowed. A clickable link counts as a locator unless the rule explicitly requires visible URL text. A field with an empty value is not a disclosed date/version. Before declaring a source/element absent, inspect relevant files and indexed structures and state the scope checked. Do not confuse extraction limitations with submission defects.
 {image_note}
 Process record: {json.dumps(manifest['process_record'], ensure_ascii=False, default=str)}
 Rubric time context: {json.dumps(time_notes, ensure_ascii=False)}. The process execution timestamp is {manifest['process_record'].get('executed_at') or 'not recorded'}. A rubric preparation date is not automatically a participant execution date. If a delivered report states a cutoff matching its preserved file modification date and no stronger execution timestamp contradicts it, treat that as supportive context. Record the inference and its limitation. Do not deduct solely because a reused delivery is later than the rubric preparation baseline.
-
-Assigned rubric atoms (verbatim rule text):\n{json.dumps(rules, ensure_ascii=False, indent=2)}
 
 Return one decision for EVERY assigned atom, in this order. Use the exact rubric conditions. For BIN state is 0 or 1. For RATIO/CLAIM-RATIO/COUNT give numerator, denominator, state= numerator/denominator, and an `items` array that identifies each counted element, its result and supporting location. Prefer claim as the text field identifying each audited statement; supported semantic field aliases remain accepted. If the rule specifies an empty-set state, use it with numerator=denominator=0. If the denominator is an exhaustive set, inspect the entire relevant delivery; do not silently sample. For a capped count formula min(n/target,1) or min(n,target)/target, report the actual observed count as numerator, target as denominator, and saturated state; these are distinct from success/total ratios. For thousands of workbook rows, use exact material_inspector calculations with explicit worksheets/ranges, criteria and aggregate counts instead of emitting a redundant item per raw row. Retain itemized criteria and every concrete failed finding, and explain how aggregates yield the operands. For external sources, use webfetch only when needed and supply full HTTP or HTTPS URL. Historical reuse of a submission is not itself a defect; judge time-sensitive claims as of its execution/cutoff date, while following the rubric's substantive requirements. If available, use material_inspector for exact workbook statistics/correlations, cells/formulas, chart definitions and paginated OOXML inspection. It only reads this workspace's authorized materials. Never guess row counts or arithmetic from a small sample. Inspect relevant structures for chart, workbook and formatting atoms; text extraction alone cannot prove visual layout. Read long extracted files in segments through the end of the relevant scope. For required PPT rendering, use material_inspector pptx_visual; for required website layout/interactivity use browser with rubric-required viewport widths and finite controls. Cite the original file with slide/shape or viewport/selector and actual measured findings. Interpret overflow/overlap candidates in context rather than treating candidates as automatic defects. Controlled local browser JavaScript is permitted for preview; never execute delivered shell/Python/native code, perform attacks, credential checks or contact IP addresses in simulated incident logs.
 
@@ -168,7 +202,6 @@ Each decision must have id, state, observation (what the delivery actually says 
 
 Write observations, reasons and item explanations in clear Chinese. Each item explanation must address that exact item's subject, predicate, date and scope; support for another statement in the same paragraph does not establish support for this statement. A related reference title alone does not establish its unseen contents. State what was actually inspected and any access limitations, then apply the rubric without inventing a negative finding. Preserve literal evidence quotes in their original language. Return JSON only between BEGIN_JUDGMENT and END_JUDGMENT, shape: {{"atoms":[...]}}. Do not omit any atom.
 For exhaustive item checks, provide one outcome per counted item. Grouping is allowed only with explicit member IDs or a reproducible range/count, and supported per-member checks or an exact inspector calculation. A uniform template or a few populated examples never proves all remaining fields are nonempty. Do not omit relation/direction contradictions when repeated numeric values happen to match.
-{('Previous attempt failed validation: ' + previous_error) if previous_error else ''}
 """
 
 
@@ -371,12 +404,24 @@ def judge_task(task: Task, subject: str, config: dict, project: Path, run_dir: P
         for atom in batch:
             if atom.id in found:
                 continue
+            wrong_scope_replies = 0
             for attempt in range(3):
                 feedback = validation_errors.get(atom.id, "Earlier output for this atom was incomplete")
                 prompt = _prompt(task, subject, [atom], manifest, feedback + ". Correct this specific validation issue while preserving supported findings. Supply a numeric state and an itemized check for every counted element.")
                 event = event_dir / f"atoms-{index:03d}-{atom.id}-attempt-{attempt}.jsonl"
                 try:
-                    session.ask(prompt, f"repair {task.id} {subject} {atom.id}", event)
+                    answer, _ = session.ask(prompt, f"repair {task.id} {subject} {atom.id}", event)
+                    returned = atom_records(extract_json(answer, allow_array=True))
+                    returned_ids = [item.get("id") for item in returned if isinstance(item, dict)]
+                    if returned_ids and atom.id not in returned_ids:
+                        wrong_scope_replies += 1
+                        validation_errors[atom.id] = (f"Requested ONLY atom {atom.id}, but received atom IDs "
+                            f"{returned_ids}. These are not the current assignment. Return the full decision for {atom.id}.")
+                        if wrong_scope_replies == 2 and attempt < 2:
+                            session.restart(validation_errors[atom.id])
+                            print(f"  {task.id}/{subject}: 连续返回非当前评分项，保留检查点并重建本对象会话。", flush=True)
+                    else:
+                        wrong_scope_replies = 0
                 except JudgeError:
                     pass
                 harvest()

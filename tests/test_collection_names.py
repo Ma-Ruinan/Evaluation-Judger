@@ -36,6 +36,9 @@ class CollectionNames(TestCase):
             self.assertEqual(record["logical_name"], "result.csv")
             self.assertEqual(record["file"], "deliveries/actor-1.1-result.csv")
             self.assertEqual((workspace / record["file"]).read_bytes(), delivery.read_bytes())
+            import json
+            index = [json.loads(line) for line in (workspace / "material-files.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(index, manifest["files"])
             self.assertFalse((workspace / "deliveries/result.csv").exists())
             prompt = _prompt(task, "x", [], manifest)
             self.assertIn("Cite the unchanged collected path", prompt)
