@@ -18,7 +18,7 @@ class SummaryContract(TestCase):
         records = []
         for sid, state, value in [('a', '0', '0.0000'), ('b', '1', '0.9166'), ('c', '1', '0.9166')]:
             scores = {m: {'final': '100' if m == 'completion' else '5'} for m in METRICS}; scores['quality_mean'] = '5'
-            record = {'id': 'A01', 'metric': 'accuracy', 'state': state, 'weight': '100', 'items': [],
+            record = {'id': 'A01', 'metric': 'accuracy', 'state': state, 'weight': '100', 'items': None if sid != 'c' else [],
                       'observation': f'交付报告明确给出 p={value}，位于结果表第二行。',
                       'reason': f'p={value}，与标准值核验。', 'denominator': None, 'evidence': []}
             records.append({'subject': sid, 'scores': scores, 'atoms': [record], 'errors': []})
@@ -76,3 +76,25 @@ class SummaryContract(TestCase):
                 archive = json.loads((root/'process-records/dimension-1-subject-tests.json').read_text(encoding='utf-8'))
                 self.assertEqual(archive['subjects']['0']['records'][0]['runtime'], '3m2s')
                 self.assertTrue(all(sha256(path) == digest for path, digest in before.items()))
+
+    def test_task_markdown_failure_leaves_dimension_scores_and_other_exports_available(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = [SimpleNamespace(id=f'1.{i}', name=f'题目{i}', dimension='维度一') for i in (1, 2)]
+            config = {'subjects': [{'id': 'a', 'name': '对象A'}]}
+            scores = {m: {'final': '100' if m == 'completion' else '5'} for m in METRICS}
+            scores['quality_mean'] = '5'
+            records = {}
+            for task in tasks:
+                result = {'subject': 'a', 'task_id': task.id, 'atoms': [], 'errors': [], 'scores': scores,
+                          'fingerprint': 'frozen'}
+                records[(task.id, 'a')] = result
+                write_json(root / 'results' / task.id / 'a.json', result)
+            with patch('evaluation_judger.render.process_records', return_value={}), \
+                    patch('evaluation_judger.render.task_markdown', side_effect=[TypeError('format error'), 'second report']), \
+                    self.assertLogs('evaluation_judger.render', level='ERROR') as log:
+                dimension = summaries(tasks, records, config, root)['维度一']
+            self.assertIn('task 1.1', '\n'.join(log.output))
+            self.assertEqual(dimension['tasks'], ['1.1', '1.2'])
+            self.assertTrue((root / 'results/dimension-1-summary.json').is_file())
+            self.assertEqual((root / 'results/1.2/evaluation-result.md').read_text(), 'second report')

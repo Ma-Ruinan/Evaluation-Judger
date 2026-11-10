@@ -93,4 +93,28 @@ class RelationInventoryTests(unittest.TestCase):
    self.assertFalse(result['comparisons'][0]['numeric_relation_holds']);self.assertEqual(invoke.call_count,1)
    self.assertFalse(json.loads((self.workspace/'relation-inventory.json').read_text(encoding='utf-8'))['comparisons'][0]['numeric_relation_holds'])
 
+ def test_length_fallback_splits_and_resumes_validated_scopes(self):
+  text = 'A年营收135亿元，B预期167.05亿元。\nA高于B。\n' + '行业背景' * 50 + '\nA低于B。'
+  for name in ['deliveries/a.txt', 'extracted/a.txt']:
+   (self.workspace/name).write_text(text, encoding='utf-8')
+  low = copy.deepcopy(self.payload)
+  low['comparisons'][0].update(operator='lt', assertion=self.evidence('A低于B。'))
+  args = dict(workspace=self.workspace, project=project, known_files=self.known, model='test', major=1)
+  task = SimpleNamespace(id='1.8')
+  length = module.JudgeError('Response length limit reached')
+  unavailable = module.JudgeError('Temporary upstream failure')
+  with patch.object(module, 'MIN_SPLIT_CHARS', 10), patch.object(module, 'SCOPE_CONTEXT_CHARS', 0):
+   with patch.object(module, 'run', side_effect=[length, length, (json.dumps(self.payload), True), unavailable, unavailable]) as invoke:
+    with self.assertRaisesRegex(module.JudgeError, 'validated scopes retained'):
+     module.inventory_relations(task, **args)
+    self.assertEqual(invoke.call_count, 5)
+   with patch.object(module, 'run', return_value=(json.dumps(low), True)) as invoke:
+    result = module.inventory_relations(task, **args)
+    self.assertEqual(invoke.call_count, 1)
+    self.assertEqual(module.inventory_relations(task, **args)['status'], 'passed')
+    self.assertEqual(invoke.call_count, 1)
+  self.assertEqual(result['mode'], 'batched')
+  self.assertEqual([(r['id'], r['operator'], r['numeric_relation_holds']) for r in result['comparisons']],
+                   [('R001', 'gt', False), ('R002', 'lt', True)])
+
 if __name__=='__main__':unittest.main()

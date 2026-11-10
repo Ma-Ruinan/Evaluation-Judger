@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import json
+import logging
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,8 +13,8 @@ from pathlib import Path
 
 from .dataset import discover, load_config, process_records, task_fingerprint
 from .judge import judge_task
-from .judge import write_json, write_text
-from .render import make_report, summaries, task_markdown
+from .judge import write_json
+from .render import make_report, summaries, write_task_markdown
 from .reporting import make_formal_report
 from .rubric import shared_sample_references
 from .scoring import calculate, shared_items_match, result_is_consistent as _result_is_consistent
@@ -105,8 +106,8 @@ def _run_task(task, config, project, run_dir):
 
 def _run_tasks_once(tasks, config, project, run_dir):
     workers = config.get("task_workers", 1)
-    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 4:
-        raise ValueError("task_workers must be an integer in 1-4")
+    if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 8:
+        raise ValueError("task_workers must be an integer in 1-8")
     if workers == 1:
         for task in tasks:
             yield task, _run_task(task, config, project, run_dir)
@@ -173,12 +174,14 @@ def main(argv=None):
             if all((task.id, subject["id"]) in result_map for subject in config["subjects"]):
                 locked = [result_map[(task.id, subject["id"])] for subject in config["subjects"]]
                 names = {subject["id"]: subject["name"] for subject in config["subjects"]}
-                name = "compare-result.md" if len(locked) > 1 else "evaluation-result.md"
-                write_text(run_dir / "results" / task.id / name, task_markdown(task, locked, names))
+                write_task_markdown(task, locked, names, run_dir)
             dimension_tasks = [item for item in tasks if item.dimension == task.dimension]
             if task.dimension not in summarized_dimensions and all((item.id, subject["id"]) in result_map for item in dimension_tasks for subject in config["subjects"]):
-                summaries(dimension_tasks, result_map, config, run_dir)
-                summarized_dimensions.add(task.dimension)
+                try:
+                    summaries(dimension_tasks, result_map, config, run_dir)
+                    summarized_dimensions.add(task.dimension)
+                except Exception:
+                    logging.getLogger(__name__).exception("Could not export interim summary for %s", task.dimension)
         write_json(run_dir / "failures.json", failures)
     result_map, missing = _results(config, run_dir, tasks)
     print(f"Completed: {len(result_map)}/{len(tasks) * len(config['subjects'])}; missing: {missing}", flush=True)

@@ -11,10 +11,11 @@ import re
 from .opencode import JudgeError, extract_json, run
 
 VERSION = 1
+SCOPE_CHARS = 8000
+SCOPE_CONTEXT_CHARS = 400
+MIN_SPLIT_CHARS = 1500
 
-PROMPT = '''Read manifest.json and ALL original/extracted participant delivery files, including conclusions,
-detail sections, tables and chart descriptions. Do not read prior atom decisions, scores or another participant.
-Inventory asserted numerical comparisons (greater/less/higher/lower/more/less/above/below,
+INVENTORY_RULES = '''Inventory asserted numerical comparisons (greater/less/higher/lower/more/less/above/below,
 高于/低于/多于/少于/大于/小于/超过/不及/领先/落后). Bind locally unstated operands to exact declarations
 of the SAME subject, measure, period and unit elsewhere in this delivery. Keep both contradictory directions,
 not just repeated numerical tables. Separate conditional predictions, different scope and rounding.
@@ -34,6 +35,9 @@ Return BEGIN_JUDGMENT JSON:
 "unresolved":[{"assertion":"comparison whose operands cannot be bound","reason":"specific limitation"}]}
 END_JUDGMENT. Empty comparisons allowed when none are present; explain inspected scope.
 '''
+PROMPT = '''Read manifest.json and ALL original/extracted participant delivery files, including conclusions,
+detail sections, tables and chart descriptions. Do not read prior atom decisions, scores or another participant.
+''' + INVENTORY_RULES
 
 
 def _normalized(text):
@@ -146,6 +150,130 @@ def validate_inventory(payload, workspace, known_files, manifest, *, tolerate_pa
             'note': 'Arithmetic witnesses only. Rubric decides scope, materiality, ownership and caps. Not automatic deductions.'}
 
 
+def _scope_boundary(text: str, start: int, preferred: int) -> int:
+    # Favor a line boundary without creating a tiny shard or skipping long lines.
+    boundary = text.rfind('\n', start + (preferred - start) // 2, preferred)
+    return boundary + 1 if boundary >= 0 else preferred
+
+
+def _batched_inventory(task, *, workspace, project, known_files, manifest, model, major, timeout, digest):
+    from .judge import write_json, write_text
+
+    deliveries = [item for item in manifest['files'] if item['category'] == 'deliveries']
+    allowed = known_files & {item[key] for item in deliveries for key in ('file', 'extracted')}
+    events = workspace / 'events'
+    batches = []
+
+    def review_scope(item, text, start, end, *, original_only=False):
+        source = item['file']
+        extracted = item['extracted']
+        scope = [source, extracted, start, end, original_only]
+        key = hashlib.sha256(json.dumps(['relation-scope-v1', digest, scope, model, major]).encode()).hexdigest()
+        stem = f'relation-scope-{key[:16]}'
+        checkpoint = workspace / 'checkpoints' / f'{stem}.json'
+        context_start = max(0, start-SCOPE_CONTEXT_CHARS)
+        context_end = end+SCOPE_CONTEXT_CHARS
+        excerpt = text[context_start:context_end]
+
+        def validate(candidate):
+            checked = validate_inventory(candidate, workspace, allowed, manifest, tolerate_partial=True)
+            if not isinstance(checked['coverage'], str):
+                raise ValueError('Explain the inspected scope in text.')
+            normalized_excerpt = _normalized(excerpt)
+            for comparison in checked['comparisons']:
+                assertion = comparison['assertion']
+                if (assertion['file'] not in {source, extracted}
+                        or (not original_only and _normalized(assertion['quote']) not in normalized_excerpt)):
+                    raise ValueError('An assertion must be quoted from the assigned delivery scope. Other passages may bind operands only.')
+            return (checked['coverage'], checked['comparisons'],
+                    [*candidate['unresolved'], *checked['validation_warnings']])
+
+        def review_halves():
+            middle = _scope_boundary(text, start, (start+end)//2)
+            review_scope(item, text, start, middle)
+            review_scope(item, text, middle, end)
+
+        previous = ''
+        if checkpoint.exists():
+            try:
+                saved = json.loads(checkpoint.read_text(encoding='utf-8'))
+                if saved.get('input_hash') == key:
+                    if saved.get('status') == 'passed':
+                        batches.append(validate(saved['candidate']))
+                        return
+                    if saved.get('status') == 'split':
+                        review_halves()
+                        return
+                    previous = str(saved.get('error', ''))
+            except (ValueError, TypeError, KeyError, AttributeError, OSError) as exc:
+                previous = str(exc)
+
+        if original_only:
+            assignment = (f'Read {source} in its original format. Inventory assertions outside the available extraction '
+                          f'in {extracted}. Explain any inaccessible part. Extraction limitation: {item.get("limitation")}.')
+        else:
+            excerpt_path = workspace / 'relation-scopes' / f'{stem}.txt'
+            write_text(excerpt_path, '[preceding context]\n' + text[context_start:start]
+                       + '\n[assigned text]\n' + text[start:end]
+                       + '\n[following context]\n' + text[end:context_end])
+            assignment = (f'Read {excerpt_path.relative_to(workspace).as_posix()} as the assigned assertion scope '
+                          f'(characters {start+1} through {end} of {extracted}). Cite {extracted} or {source}, '
+                          'never the scope copy. The marked neighboring context is for binding, including assertions crossing the boundary.')
+
+        # Keep the original evidence contract and schema, replacing only its whole-delivery read scope.
+        prompt = (assignment + '\nOnly inventory assertions in this scope, including both directions if present. '
+                  'Consult other passages or deliveries only to bind operands. Do not repeat a whole-delivery scan. '
+                  'Return compact JSON with short literal quotes and no duplicate entries. '
+                  'Do not read prior scores or another participant.\n\n' + INVENTORY_RULES)
+        offset = max((int(p.stem.rsplit('-', 1)[1]) + 1 for p in events.glob(f'{stem}-*.jsonl')), default=0)
+        for attempt in range(2):
+            try:
+                answer, used_read = run(workspace, prompt + (f'\nCorrect the prior issue: {previous[:800]}' if previous else ''),
+                    f'relation scope {task.id}', events / f'{stem}-{offset+attempt}.jsonl', project, model,
+                    timeout, major, _continue_length=False)
+                if not used_read:
+                    raise ValueError('Relation scope must read the assigned evidence.')
+                candidate = extract_json(answer)
+                validated = validate(candidate)
+                write_json(checkpoint, {'input_hash': key, 'status': 'passed', 'candidate': candidate})
+                batches.append(validated)
+                return
+            except (JudgeError, ValueError, TypeError, KeyError, OSError) as exc:
+                previous = str(exc)
+                if 'Response length limit' in previous and not original_only and end-start > MIN_SPLIT_CHARS:
+                    write_json(checkpoint, {'input_hash': key, 'status': 'split'})
+                    review_halves()
+                    return
+        write_json(checkpoint, {'input_hash': key, 'status': 'incomplete', 'error': previous})
+        raise JudgeError(f'Relation scope incomplete for {source} ({start+1}-{end}): {previous}')
+
+    for item in deliveries:
+        text = (workspace / item['extracted']).read_text(encoding='utf-8')
+        start = 0
+        while start < len(text):
+            end = len(text) if len(text)-start <= SCOPE_CHARS else _scope_boundary(text, start, start+SCOPE_CHARS)
+            review_scope(item, text, start, end)
+            start = end
+        if not text.strip() or item.get('limitation'):
+            review_scope(item, text, 0, 0, original_only=True)
+
+    comparisons, unresolved, seen = [], [], set()
+    for _, findings, unbound in batches:
+        for comparison in findings:
+            content = {k: v for k, v in comparison.items() if k not in {'id', 'numeric_relation_holds', 'binding_notes'}}
+            identity = json.dumps(content, ensure_ascii=False, sort_keys=True)
+            if identity not in seen:
+                seen.add(identity)
+                comparisons.append({'id': f'R{len(comparisons)+1:03d}', **content})
+        for item in unbound:
+            if isinstance(item, dict) and 'id' in item:
+                item = {**item, 'id': f'U{len(unresolved)+1:03d}'}
+            unresolved.append(item)
+    merged = {'coverage': '\n'.join(coverage for coverage, _, _ in batches),
+              'comparisons': comparisons, 'unresolved': unresolved}
+    return merged, validate_inventory(merged, workspace, allowed, manifest, tolerate_partial=True)
+
+
 def inventory_relations(task, *, workspace: Path, project: Path, known_files: set[str],
                         model: str, major: int, timeout: int = 1800):
     from .judge import write_json
@@ -156,22 +284,28 @@ def inventory_relations(task, *, workspace: Path, project: Path, known_files: se
     digest = hashlib.sha256(json.dumps([VERSION, PROMPT, bindings], ensure_ascii=False).encode()).hexdigest()
     checkpoint = workspace/'checkpoints'/f'relation-inventory-{digest[:12]}.json'
     previous = ''
+    batched = False
     if checkpoint.exists():
         try:
             cached = json.loads(checkpoint.read_text(encoding='utf-8'))
+            if not isinstance(cached, dict):
+                raise ValueError('Invalid relation inventory checkpoint')
             if cached.get('input_hash') == digest and cached.get('status') == 'passed':
                 checked = validate_inventory(cached['candidate'], workspace, known_files, manifest, tolerate_partial=True)
                 refreshed = {**cached, **checked}
                 write_json(checkpoint, refreshed)
                 write_json(workspace/'relation-inventory.json', refreshed)
                 return refreshed
-            previous = str(cached.get('error', ''))
+            if cached.get('input_hash') == digest:
+                previous = str(cached.get('error', ''))
+                batched = cached.get('mode') == 'batched' or 'Response length limit' in previous
         except (ValueError, TypeError, KeyError, OSError) as exc:
             previous = str(exc)
     events = workspace/'events'
     events.mkdir(exist_ok=True)
     candidates = sorted(workspace.glob(f'relation-candidate-{digest[:12]}-*.json'))
-    offset = max((int(p.stem.rsplit('-', 1)[1])+1 for p in candidates), default=0)
+    attempts = (workspace/'checkpoints').glob(f'relation-attempt-{digest[:12]}-*.json')
+    offset = max((int(p.stem.rsplit('-', 1)[1])+1 for p in [*candidates, *attempts]), default=0)
     candidate_path = max(candidates, key=lambda p: p.stat().st_mtime_ns) if candidates else None
     if candidate_path:
         try:
@@ -184,7 +318,7 @@ def inventory_relations(task, *, workspace: Path, project: Path, known_files: se
             return result
         except (ValueError, TypeError, KeyError, OSError) as exc:
             previous = str(exc)
-    for attempt in range(2):
+    for attempt in range(0 if batched else 2):
         try:
             prompt = PROMPT + ('\nValidation feedback: '+previous if previous else '')
             if candidate_path:
@@ -206,5 +340,21 @@ def inventory_relations(task, *, workspace: Path, project: Path, known_files: se
             previous = str(exc)
             write_json(workspace/'checkpoints'/f'relation-attempt-{digest[:12]}-{offset+attempt}.json',
                        {'status': 'rejected', 'error': previous, 'candidate': candidate_path.name if candidate_path else None})
+            if 'Response length limit' in previous:
+                batched = True
+                break
+    if batched:
+        state = {'version': VERSION, 'status': 'incomplete', 'input_hash': digest, 'mode': 'batched'}
+        write_json(checkpoint, {**state, 'error': previous})
+        try:
+            candidate, checked = _batched_inventory(task, workspace=workspace, project=project,
+                known_files=known_files, manifest=manifest, model=model, major=major, timeout=timeout, digest=digest)
+        except (JudgeError, ValueError, TypeError, KeyError, OSError) as exc:
+            write_json(checkpoint, {**state, 'error': str(exc)})
+            raise JudgeError(f'Relation inventory incomplete; validated scopes retained for resume: {exc}') from exc
+        result = {**state, 'status': 'passed', 'candidate': candidate, **checked}
+        write_json(checkpoint, result)
+        write_json(workspace/'relation-inventory.json', result)
+        return result
     write_json(checkpoint, {'version': VERSION, 'status': 'incomplete', 'input_hash': digest, 'error': previous})
     raise JudgeError('Relation inventory incomplete; saved candidates/checkpoints permit resume: '+previous)

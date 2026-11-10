@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import re
 from html import escape
 from collections import defaultdict
@@ -64,9 +65,9 @@ def _atom_difference(atom_records: list[dict], names: list[str]) -> str:
     if len(atom_records) != 2:
         return "分数见上表；完整依据见下文。"
     left, right = atom_records
-    right_items = {_item_label(item).strip(): item for item in right.get("items", []) if isinstance(item, dict) and _item_label(item).strip()}
+    right_items = {_item_label(item).strip(): item for item in (right.get("items") or []) if isinstance(item, dict) and _item_label(item).strip()}
     differences = []
-    for item in left.get("items", []):
+    for item in left.get("items") or []:
         if not isinstance(item, dict):
             continue
         label = _item_label(item).strip()
@@ -82,7 +83,7 @@ def _atom_difference(atom_records: list[dict], names: list[str]) -> str:
         return "；".join(differences[:2]) + tail
     parts = []
     for name, atom in zip(names, atom_records):
-        failed = [item for item in atom.get("items", []) if isinstance(item, dict) and _item_passed(item) is False]
+        failed = [item for item in (atom.get("items") or []) if isinstance(item, dict) and _item_passed(item) is False]
         if failed:
             examples = "、".join(_safe(_item_label(item) or item.get("source") or "核验项") for item in failed[:2])
             parts.append(f"{_safe(name)}：{len(failed)}项未通过，如{examples}")
@@ -258,6 +259,15 @@ def task_markdown(task, results: list[dict], names: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+def write_task_markdown(task, results: list[dict], names: dict[str, str], run_dir: Path) -> None:
+    path = run_dir / "results" / task.id / ("compare-result.md" if len(results) > 1 else "evaluation-result.md")
+    try:
+        write_text(path, task_markdown(task, results, names))
+    except Exception:
+        # The locked score JSON is independent of this presentation artifact.
+        logging.getLogger(__name__).exception("Could not export task %s Markdown to %s", task.id, path)
+
+
 def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
     names = {s["id"]: s["name"] for s in config["subjects"]}
     process = process_records(config)
@@ -265,8 +275,7 @@ def summaries(tasks, result_map: dict, config: dict, run_dir: Path) -> dict:
     for task in tasks:
         results = [result_map[(task.id, s["id"])] for s in config["subjects"]]
         by_dim[task.dimension].append((task, results))
-        path = run_dir / "results" / task.id / ("compare-result.md" if len(results) > 1 else "evaluation-result.md")
-        write_text(path, task_markdown(task, results, names))
+        write_task_markdown(task, results, names, run_dir)
     dimensions = {}
     for dim, entries in by_dim.items():
         summary = {"dimension": dim, "tasks": [t.id for t, _ in entries], "subjects": {}, "task_results": [],
