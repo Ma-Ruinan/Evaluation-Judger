@@ -1,8 +1,10 @@
 # Evaluation Judger
 
-Evaluation Judger 按固定的 `rubric.md` 评测 AI Agent 的交付物。一次运行处理一个数据集，支持单对象评测和最多三个对象的横向比较，输出逐题证据与评分、维度汇总和 Word 报告。
+Evaluation Judger 按固定的 `rubric.md` 评测智能体应用的交付物。一次运行处理一个数据集，支持单对象评测和最多三个对象的横向比较，输出逐题证据与评分、维度汇总和 Word 报告。
 
-搭配使用时，先用 [Rubric Council](https://github.com/Ma-Ruinan/Rubric-Council) 根据问题和源素材生成并审核每题的 `rubric.md`，再把交付物和测试记录加入数据集，由 Evaluation Judger 使用同一套规则评测各对象。OpenCode 负责核验证据并给出逐项判定，Python 程序负责校验、按权重复算、应用错误封顶和汇总。
+搭配使用时，先用 [Rubric Council](https://github.com/Ma-Ruinan/Rubric-Council) 根据问题和源素材生成并审核每题的 `rubric.md`，再把交付物和测试记录加入数据集，由 Evaluation Judger 使用同一套规则评测各对象。
+
+基于 OpenCode 实现的评测多智能体负责核验证据并给出逐项判定，Python 程序负责校验、按权重复算、应用错误封顶和汇总。
 
 [查看评测流程图](docs/assets/evaluation-judger-pipeline.svg)
 
@@ -32,13 +34,13 @@ Copy-Item config.example.json config.eval.local.json
     └── 1_资料核验/
         ├── 问题描述.txt
         ├── rubric.md
-        ├── 参考资料.pdf
-        ├── agent-a-报告.docx
-        └── agent-b-报告.docx
+        ├── 问题源素材.pdf
+        ├── 受测对象A交付文件.docx/pdf/html/xlsx...
+        └── 受测对象B交付文件.docx/pdf/html/xlsx...
 ```
 
 - 每题需要 UTF-8 的 `问题描述.txt`、结构化 `rubric.md`，以及每个纳入对象的至少一份交付物。按题放入所需的源素材。
-- 程序按配置的前缀归属交付物，例如 `agent-a-`。多个文件也可以放在带前缀的题目直属目录里。只评部分对象时，用 `excluded_subject_prefixes` 排除其余交付物。未归属且未排除的文件会按源素材读取。
+- 程序按配置的前缀归属交付物，例如 `受测对象A`。多个文件也可以放在带前缀的题目直属目录里。只评部分对象时，用 `excluded_subject_prefixes` 排除其余交付物。未归属且未排除的文件会按源素材读取。
 - 测试记录 Excel 是必需输入。为每道纳入的题提供一行，按对象映射用时、状态列。可另外指定执行时间列，供涉及时效性的评分项取证。
 
 在 `config.eval.local.json` 中调整以下字段。仓库中的[示例配置](config.example.json)展示的是一份 DeepInsight 数据集的列映射和范围。
